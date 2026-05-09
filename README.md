@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # DNC Lore Bot
 
 A Discord roleplay bot that quietly listens to long-form messages, has an LLM
@@ -103,4 +104,6 @@ matters to you. To wipe and start fresh, delete the directory.
   collections keyed by channel.
 - **Source links**: include `metadata.source_message_id` in replies so users
   can jump back to the original message via `https://discord.com/channels/...`.
+=======
+>>>>>>> bec5338bf784fe4c86ae9da7cda681ff5437f7f6
 # DNCbot
