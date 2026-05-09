@@ -1,0 +1,172 @@
+# =====================================================================
+# DNC Lore Bot — configuration (v0.6)
+# =====================================================================
+
+bot:
+  command_prefix: "!DNC"
+  min_message_length: 100       # minimum chars for text-only posts
+  min_image_message_length: 10  # minimum chars for posts with an image attached
+  
+  # Multi-part post grouping: consecutive messages from the same author in the same
+  # channel within this window are buffered and ingested as one combined memory.
+  # !DNC gm also uses this window to detect split actions.
+  chain_delay_seconds: 30
+
+  # Multi-turn reply support
+  conversation:
+    # Max number of prior messages included as context when reconstructing
+    # a reply chain.
+    max_chain_depth: 5
+    # Per-message char cap when including history. Current message is
+    # NEVER truncated — only prior messages.
+    max_history_message_chars: 2000
+
+  # Year rollover scheduling
+  year_rollover:
+    enabled: false
+    interval_days: 7
+    announcement_channels:
+      - "announcements"
+    announcement_template: |
+      📜 **The year turns. It is now {year}.**
+    year_check_channel: ""
+
+discord:
+  # --- CHANNELS ---
+  channels:
+    # Non-command messages in these channels are ingested into memory.
+    scan:
+      - "🌎international-affairs🌎"
+      - "🏠domestic-actions🏠"
+      - "📰news📰"
+      - "🪖military-actions🪖"
+      - "🏭production🏭"
+      - "🧪research🧪"
+      - "🤫secret-actions🤫"
+    # These channels are never scanned, even if scan: is empty (scan all).
+    ignored:
+      - "off-topic"
+      - "memes"
+      - "bot-spam"
+      - "bot-commands"
+    # Admin commands only work in these channels.
+    admin:
+      - "⚙bot-log⚙"
+      - "staff-chat"
+
+  # --- ROLE-BASED PERMISSIONS ---
+  # Names are matched case-insensitively against Discord role names.
+  roles:
+    # Manage Server permission ALSO grants admin powers as a fallback.
+    admin:
+      - "Administrators"
+    # Roles allowed to use !DNC chatuc from any channel.
+    # Falls back to admin roles if empty.
+    chatuc:
+      - "Central Arbiter"
+
+# --- GM MODE SETTINGS ---
+gm:
+  # Roles allowed to use !DNC gm and revise rulings by replying.
+  # Falls back to admin roles if empty.
+  roles:
+    - "Department of GMs"
+  # Channels where !DNC gm can be invoked. If empty, allowed from any channel.
+  channels:
+    - "🎲gm-requests🎲"
+  # Channel where GM rulings are posted. If empty, bot replies in the invoking channel.
+  output_channel: "🎰gm-answers🎰"
+
+# --- MODEL & PROVIDER SETTINGS ---
+models:
+  provider:
+    # LLM provider — any OpenAI-compatible API (OpenRouter, HuggingFace TGI, vLLM, etc.)
+    base_url: "https://openrouter.ai/api/v1"
+    # Optional headers forwarded to the provider (used by OpenRouter for attribution)
+    site_url: "https://github.com/your-repo"
+    site_name: "DNC Lore Bot"
+    # Embeddings provider — can be the same or a different endpoint.
+    # Falls back to base_url if not set. Set EMBEDDING_API_KEY in .env for a separate key.
+    embedding_base_url: "https://openrouter.ai/api/v1/"
+  
+  # Default settings used when a mode field is left blank.
+  defaults:
+    model: "deepseek/deepseek-v4-flash"
+    temperature: 0.7
+
+  # Specialized models
+  vision_model: "google/gemini-2.5-flash"
+  embedding_model: "Qwen/Qwen3-Embedding-8B"
+
+  # Per-mode LLM overrides. Leave blank to inherit defaults.
+  # thinking_budget: controls thinking for capable models (Gemini, DeepSeek-R1, etc.)
+  modes:
+    chat:
+      model: deepseek/deepseek-v4-flash
+      temperature: 1.0
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 0
+    chatuc:
+      model: nousresearch/hermes-4-405b
+      temperature: 1.1
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: none
+    query:
+      model: z-ai/glm-5.1
+      temperature: 0.7
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: low
+    gm:
+      model: z-ai/glm-5.1
+      temperature: 0.7
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 1500
+    archivist:
+      model: mistralai/ministral-14b-2512
+      temperature: 0.3
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: none
+
+# --- PERSISTENCE ---
+memory:
+  db_path: "./memory_store"
+  # Search results per query
+  top_k: 20
+  # If true, drop summaries tagged NO_LORE
+  filter_non_lore: true
+  # How long voided memories stay recoverable
+  void_retention_days: 30
+  # Store original message text in metadata
+  store_full_message: true
+
+# Path to the chat blacklist file (created automatically if missing)
+chat_blacklist_file: "chat_blacklist.txt"
+
+# --- TAVILY WEB SEARCH ---
+# The model decides when to call web_search; it is never called automatically.
+# Only chat and chatuc modes support Tavily — query and gm always use ChromaDB only.
+tavily:
+  enabled_modes:
+    chat: true
+    chatuc: true
+  max_results: 5
+  search_depth: "basic"   # "basic" or "advanced"
+
+# --- SYSTEM PROMPTS ---
+prompts:
+  memory_extraction: "prompts/memory_extraction.txt"
+  vision_extraction: "prompts/vision_extraction.txt"
+  lore_query: "prompts/lore_query.txt"
+  chat: "prompts/chat.txt"
+  chat_unhinged: "prompts/chat_unhinged.txt"
+  gm_ruling: "prompts/gm_ruling.txt"

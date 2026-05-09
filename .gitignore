@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Runtime data — do not commit
+memory_store/
+logs/
+exports/
+state.json
+optouts.txt
+chat_blacklist.txt
+voided_memories.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
