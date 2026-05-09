@@ -103,3 +103,4 @@ matters to you. To wipe and start fresh, delete the directory.
   collections keyed by channel.
 - **Source links**: include `metadata.source_message_id` in replies so users
   can jump back to the original message via `https://discord.com/channels/...`.
+# DNCbot
