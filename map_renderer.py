@@ -60,10 +60,10 @@ TAG_TO_NAME: dict[str, str] = {
     "FRA": "France",
     "CHN": "China",
     "JPN": "Japan",
+    "FRG": "West Germany",   # primary — wins _NAME_TO_TAG reverse lookup
     "DEW": "West Germany",
-    "FRG": "West Germany",
+    "GDR": "East Germany",   # primary — wins _NAME_TO_TAG reverse lookup
     "DDR": "East Germany",
-    "GDR": "East Germany",
     "ITA": "Italy",
     "CAN": "Canada",
     "AUS": "Australia",
