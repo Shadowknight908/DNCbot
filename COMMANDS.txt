@@ -1,0 +1,181 @@
+DNC LORE BOT — COMMAND REFERENCE (v0.8.3)
+==========================================
+Prefix: !DNC
+Prefix followed by a bare question = lore query (no subcommand needed)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PUBLIC COMMANDS  (anyone, any channel)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+!DNC <question>
+    Query the lore archive. Bot searches memory and replies in-character.
+    Example: !DNC Who rules the Eastern Bloc?
+
+!DNC chat <message>
+    General conversation with the bot (with memory context).
+    You can continue by replying to the bot's response without a prefix.
+
+!DNC gm <discord-message-link>
+    GM adjudication mode. Fetches the linked post, reviews author history
+    and semantic context, then issues a ruling.
+    Requires: gm_roles or admin. Must be used in a configured GM channel.
+    Example: !DNC gm https://discord.com/channels/123/456/789
+
+!DNC year
+    Show the current in-game year.
+
+!DNC optout
+    Remove your messages from future ingestion (opt out of lore archiving).
+
+!DNC optin
+    Re-enable ingestion of your messages after a previous optout.
+
+!DNC whoami
+    Show your current permission level (admin / GM / user).
+
+!DNC help
+    Show command help (output varies based on your permissions).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAP COMMANDS — PUBLIC
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+!DNC map
+    Render and post the full world map, coloured by player ownership.
+
+!DNC mapzoom <TAG>
+    Zoom into a specific country and render just that region.
+    TAG is a 2–4 letter ISO-style country tag (e.g. USA, USSR, GBR).
+    Example: !DNC mapzoom USSR
+
+!DNC maplist
+    List all countries that have been subdivided into provinces, with
+    province counts.
+
+!DNC maplist <TAG>
+    List all provinces within a country and show their current owners.
+    Example: !DNC maplist USSR
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAP COMMANDS — ADMIN ONLY
+(requires admin role + admin channel)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+!DNC mapdivide <TAG> <N>
+    Subdivide a country into N auto-generated provinces (2–100).
+    Provinces are named TAG-01, TAG-02, etc.
+    Example: !DNC mapdivide USSR 15
+
+!DNC mapmerge <TAG>
+    Remove all provinces for a country, reverting it to whole-country
+    ownership.
+    Example: !DNC mapmerge USSR
+
+!DNC mapset <PROVINCE_ID> @player
+    Manually assign ownership of a province to a player.
+    PROVINCE_ID is the full province tag (e.g. USSR-03).
+    Example: !DNC mapset USSR-03 @Stalin
+
+!DNC maprelease <PROVINCE_ID>
+    Release a province so it becomes uncontrolled.
+    Example: !DNC maprelease USSR-03
+
+!DNC mapparse <discord-message-link>
+    Feed a roleplay post to the LLM, which proposes ownership changes
+    based on what happened in the post. Admins then react ✅ to apply
+    or ❌ to cancel. Changes take effect immediately on ✅.
+    Example: !DNC mapparse https://discord.com/channels/123/456/789
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN COMMANDS — GENERAL
+(requires admin role + admin channel unless noted)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+!DNC chatuc <message>
+    "Unhinged" chat mode — uses a different personality prompt.
+    Admin only (any channel).
+
+!DNC chatban @user
+    Ban a user from using !DNC chat / chatuc / reply-chain conversation.
+    Example: !DNC chatban @TroubleMaker
+
+!DNC chatunban @user
+    Lift a chat ban.
+    Example: !DNC chatunban @TroubleMaker
+
+!DNC ingest [#channel] <N>
+    Backfill the N most recent messages from the current channel
+    (or the specified channel) into the lore archive.
+    Example: !DNC ingest #rp-eastern-europe 200
+
+!DNC ingest [#channel] <YYYY-MM-DD> <YYYY-MM-DD>
+    Backfill all messages in a date range.
+    Example: !DNC ingest 1970-01-01 1970-06-30
+
+!DNC ingest <discord-message-link>
+    Ingest a single specific message.
+    Example: !DNC ingest https://discord.com/channels/123/456/789
+
+!DNC void @user
+    Void (soft-delete) all archived memories attributed to a user.
+
+!DNC void <discord-message-link>
+    Void the memory derived from a specific message.
+
+!DNC void <memory-ID>
+    Void a specific memory by its ChromaDB ID.
+
+!DNC unvoid <void-group-ID>
+    Restore a voided memory group within the retention window (default 30 days).
+
+!DNC yearset <year>
+    Set the current in-game year silently (no announcement).
+    Example: !DNC yearset 1971
+
+!DNC yearroll
+    Increment the in-game year by 1 and post an announcement.
+
+!DNC purge year <year>
+    Void all memories tagged with a specific in-game year.
+    Example: !DNC purge year 1969
+
+!DNC export
+    Export all non-voided memories to exports/ as JSON and Markdown files.
+
+!DNC stats
+    Show token usage and message statistics.
+
+!DNC stats reset
+    Reset all statistics counters.
+
+!DNC channels
+    Diagnostic: compare config-listed channels against actual Discord channels.
+
+!DNC reloadprompts
+    Hot-reload all prompt files from disk without restarting the bot.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REPLY-CHAIN CONTINUATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After any bot response to !DNC chat, !DNC chatuc, !DNC gm, or a query,
+you can reply directly to the bot message (without a prefix) to continue
+the conversation. The bot will walk up to 5 messages of prior context.
+
+Only the original mode's permission rules apply for continuations:
+  - chat:    anyone can reply
+  - chatuc:  admin-only (same as initial command)
+  - gm:      gm_roles or admin can revise a ruling
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+QUICK-START: MAP WORKFLOW EXAMPLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. !DNC map                         — see the starting map
+2. !DNC mapdivide USSR 12           — split USSR into 12 provinces
+3. !DNC mapset USSR-01 @Khrushchev  — assign province 1
+4. !DNC maplist USSR                — review all provinces and owners
+5. !DNC mapparse <link-to-rp-post>  — let the LLM auto-detect changes
+6. !DNC mapzoom USSR                — zoom in to see the result
+7. !DNC mapmerge USSR               — undo all provinces if needed

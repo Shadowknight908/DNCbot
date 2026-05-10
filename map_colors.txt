@@ -1,0 +1,12 @@
+AUS #e9c46a
+CHN #118ab2
+DEU #f4a261
+FRA #2a9d8f
+GRC #457b9d
+HND #06d6a0
+RHO #ff595e
+TUR #ffca3a
+USA #e63946
+USSR #6a4c93
+WSM #1982c4
+YUG #8ac926

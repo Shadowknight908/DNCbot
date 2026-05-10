@@ -11,6 +11,7 @@ Major additions vs v0.5.1:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -39,6 +40,14 @@ from state_store import StateStore
 from tavily_client import TavilyClient
 import reply_chain
 import year_scheduler
+
+from map_colors import MapColorStore
+from map_store import MapStore
+import map_renderer
+import map_scheduler as map_sched
+from nickname_parser import parse_tag
+from province_store import ProvinceStore
+import map_llm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -177,6 +186,18 @@ class LoreBot(commands.Bot):
         )
         self.flog = FileLoggers("logs")
         self.prompts = PromptStore(config.get("prompts", {}))
+
+        map_cfg = config.get("spatial_mapping", {})
+        self.map_colors = MapColorStore(
+            path="map_colors.txt",
+            palette=map_cfg.get("color_palette") or None,
+        )
+        self.map_store = MapStore(self.map_colors)
+        self.province_store = ProvinceStore(
+            color_store=self.map_colors,
+            definitions_path=map_cfg.get("province_data_path", "map_data/provinces.json"),
+            ownership_path=map_cfg.get("province_ownership_path", "province_ownership.json"),
+        )
 
         tavily_key = os.environ.get("TAVILY_API_KEY", "")
         tavily_cfg = config.get("tavily", {})
@@ -320,6 +341,21 @@ class LoreBot(commands.Bot):
         member_roles = {r.name.lower() for r in message.author.roles}
         return bool(member_roles & self._chatuc_roles)
 
+    def _is_admin_user_by_id(
+        self, user: discord.abc.User, guild: Optional[discord.Guild]
+    ) -> bool:
+        """Check admin status from a raw user object (e.g. in reaction checks)."""
+        if guild is None:
+            return False
+        member = guild.get_member(user.id)
+        if member is None:
+            return False
+        if member.guild_permissions.manage_guild:
+            return True
+        if not self._admin_roles:
+            return False
+        return bool({r.name.lower() for r in member.roles} & self._admin_roles)
+
     def _mode_settings(self, mode: str) -> dict:
         """Returns chat_messages kwargs for a given mode, read from config.models.modes."""
         m_cfg = self.cfg.get("models", {})
@@ -353,10 +389,30 @@ class LoreBot(commands.Bot):
         if self.cfg["bot"].get("year_rollover", {}).get("enabled"):
             if not self._rollover_task.is_running():
                 self._rollover_task.start()
+        if self.cfg.get("spatial_mapping", {}).get("enabled"):
+            if not self._map_render_task.is_running():
+                self._map_render_task.start()
 
     async def on_member_remove(self, member: discord.Member):
         if self.optouts.remove(str(member.id)):
             log.info("Auto-pruned opt-out for %s (%s)", member.display_name, member.id)
+
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if before.nick == after.nick:
+            return
+        if not self.cfg.get("spatial_mapping", {}).get("enabled"):
+            return
+        old_tag = parse_tag(before.nick or before.name)
+        new_tag = parse_tag(after.nick or after.name)
+        if old_tag == new_tag:
+            return
+        if old_tag:
+            self.map_store.clear_occupation(old_tag)
+            log.info("Map: vacated %s (nick change by %s)", old_tag, after.display_name)
+        if new_tag:
+            self.map_store.set_occupation(new_tag, str(after.id), after.display_name)
+            log.info("Map: assigned %s → %s", new_tag, after.display_name)
+        await self._render_and_post_map()
 
     # ------------------------------------------------------------------
     @tasks.loop(hours=1)
@@ -377,6 +433,21 @@ class LoreBot(commands.Bot):
     @_rollover_task.before_loop
     async def _before_rollover(self):
         await self.wait_until_ready()
+
+    @tasks.loop(hours=24)
+    async def _map_render_task(self):
+        if not self.cfg.get("spatial_mapping", {}).get("enabled"):
+            return
+        for guild in self.guilds:
+            self.map_store.rebuild(map_sched.scan_members(guild.members))
+        await self._render_and_post_map()
+
+    @_map_render_task.before_loop
+    async def _before_map_render(self):
+        await self.wait_until_ready()
+        for guild in self.guilds:
+            self.map_store.rebuild(map_sched.scan_members(guild.members))
+        log.info("Map: initial scan complete — %d nations occupied", len(self.map_store.get_occupation()))
 
     async def _announce_year_roll(self, year: int):
         cfg = self.cfg["bot"].get("year_rollover", {})
@@ -1923,6 +1994,399 @@ class LoreBot(commands.Bot):
         await message.reply("\n".join(lines))
 
     # ------------------------------------------------------------------
+    def _get_map_channel(self) -> Optional[discord.TextChannel]:
+        name = normalize_channel_name(
+            self.cfg.get("spatial_mapping", {}).get("output_channel", "") or ""
+        )
+        if not name:
+            return None
+        for guild in self.guilds:
+            for ch in guild.text_channels:
+                if normalize_channel_name(ch.name) == name:
+                    return ch
+        return None
+
+    def _province_render_args(self) -> dict:
+        """Build keyword args for map_renderer calls that include province state."""
+        return dict(
+            province_ownership=self.province_store.get_ownership(),
+            province_definitions=self.province_store.all_definitions(),
+            subdivided_tags=self.province_store.subdivided_tags(),
+        )
+
+    async def _render_and_post_map(
+        self, channel: Optional[discord.TextChannel] = None
+    ) -> Optional[discord.Message]:
+        target = channel or self._get_map_channel()
+        if target is None:
+            log.warning("spatial_mapping: output_channel not found, skipping render")
+            return None
+        occupation = self.map_store.get_occupation()
+        try:
+            img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+        except Exception as e:
+            log.error("Map render failed: %s", e, exc_info=True)
+            return None
+        try:
+            return await target.send(
+                file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png")
+            )
+        except discord.Forbidden:
+            log.warning("Map: no permission to post in #%s", target.name)
+            return None
+
+    async def _cmd_map(self, message: discord.Message) -> None:
+        for guild in self.guilds:
+            self.map_store.rebuild(map_sched.scan_members(guild.members))
+        occupation = self.map_store.get_occupation()
+        async with message.channel.typing():
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            except Exception as e:
+                await message.reply(f"Map render failed: {e}")
+                return
+        await message.reply(
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png")
+        )
+
+    async def _cmd_mapzoom(self, message: discord.Message, tag: str) -> None:
+        tag = tag.strip().upper()
+        if not re.match(r"^[A-Z]{2,4}$", tag):
+            await message.reply(
+                "Please provide a valid ISO country tag (2–4 uppercase letters), "
+                f"e.g. `{self.prefix} mapzoom USA`."
+            )
+            return
+        map_cfg = self.cfg.get("spatial_mapping", {})
+        buffer_deg = float(map_cfg.get("zoom_buffer_deg", 5.0))
+        occupation = self.map_store.get_occupation()
+        async with message.channel.typing():
+            try:
+                img_bytes = await map_renderer.render_zoom_map(
+                    tag, occupation, buffer_deg=buffer_deg, **self._province_render_args()
+                )
+            except ValueError as e:
+                await message.reply(str(e))
+                return
+            except Exception as e:
+                await message.reply(f"Map render failed: {e}")
+                return
+        await message.reply(
+            file=discord.File(fp=io.BytesIO(img_bytes), filename=f"dnc_map_{tag}.png")
+        )
+
+    # ── Province command handlers ─────────────────────────────────────────────
+
+    def _geojson_features_for_tag(self, tag: str) -> list[dict]:
+        """Fetch the GeoJSON features for a country tag from the cached world GDF."""
+        name = map_renderer.TAG_TO_NAME.get(tag, "").strip()
+        if not name:
+            return []
+        world = map_renderer._world()
+        subset = world[world["NAME"] == name]
+        if subset.empty:
+            return []
+        # Convert each row to a GeoJSON-compatible feature dict
+        features = []
+        for _, row in subset.iterrows():
+            geom = row.geometry
+            features.append({"geometry": geom.__geo_interface__})
+        return features
+
+    async def _cmd_mapdivide(self, message: discord.Message, arg: str) -> None:
+        """!DNC mapdivide TAG N — subdivide country TAG into N auto-numbered provinces."""
+        parts = arg.strip().upper().split()
+        if len(parts) != 2 or not parts[0].isalpha() or not parts[1].isdigit():
+            await message.reply(
+                f"Usage: `{self.prefix} mapdivide TAG N`\n"
+                "Example: `!DNC mapdivide USSR 15`"
+            )
+            return
+        tag, n = parts[0], int(parts[1])
+        if n < 2 or n > 100:
+            await message.reply("Province count must be between 2 and 100.")
+            return
+
+        features = self._geojson_features_for_tag(tag)
+        if not features:
+            await message.reply(
+                f"Tag `{tag}` not found in the 1970 map. "
+                "Check `TAG_TO_NAME` in map_renderer.py."
+            )
+            return
+
+        async with message.channel.typing():
+            try:
+                provinces = self.province_store.subdivide(tag, n, features)
+            except Exception as e:
+                await message.reply(f"Subdivision failed: {e}")
+                return
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            except Exception as e:
+                await message.reply(
+                    f"Subdivided `{tag}` into {len(provinces)} provinces, "
+                    f"but map render failed: {e}"
+                )
+                return
+
+        self.flog.log_command("mapdivide", str(message.author), message.channel.name, arg)
+        await message.reply(
+            f"Subdivided `{tag}` into **{len(provinces)} provinces** "
+            f"(`{provinces[0].id}` … `{provinces[-1].id}`).",
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+        )
+
+    async def _cmd_mapmerge(self, message: discord.Message, tag: str) -> None:
+        """!DNC mapmerge TAG — remove subdivision, revert to country-level ownership."""
+        tag = tag.strip().upper()
+        if not re.match(r"^[A-Z]{2,4}$", tag):
+            await message.reply(f"Usage: `{self.prefix} mapmerge TAG`")
+            return
+
+        removed = self.province_store.merge(tag)
+        if not removed:
+            await message.reply(f"`{tag}` is not currently subdivided.")
+            return
+
+        async with message.channel.typing():
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            except Exception as e:
+                await message.reply(f"Merged `{tag}` back to country level (render failed: {e}).")
+                return
+
+        self.flog.log_command("mapmerge", str(message.author), message.channel.name, tag)
+        await message.reply(
+            f"Merged `{tag}` back to country-level ownership.",
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+        )
+
+    async def _cmd_mapset(self, message: discord.Message, arg: str) -> None:
+        """!DNC mapset PROVINCE_ID @player — manually assign province ownership."""
+        parts = arg.strip().split(None, 1)
+        if len(parts) != 2:
+            await message.reply(
+                f"Usage: `{self.prefix} mapset PROVINCE_ID @player`\n"
+                "Example: `!DNC mapset USSR-03 @Stalin`"
+            )
+            return
+        province_id = parts[0].upper()
+        mention_part = parts[1].strip()
+
+        m = MENTION_RE.match(mention_part)
+        if not m:
+            await message.reply("Please @mention the player: `!DNC mapset USSR-03 @player`")
+            return
+        user_id = m.group(1)
+
+        member = message.guild.get_member(int(user_id)) if message.guild else None
+        display_name = member.display_name if member else f"User#{user_id}"
+        player_tag = parse_tag(member.nick or member.name) if member else ""
+        if not player_tag:
+            player_tag = province_id.split("-")[0]
+
+        try:
+            self.province_store.assign(province_id, player_tag, user_id, display_name)
+        except ValueError as e:
+            await message.reply(str(e))
+            return
+
+        async with message.channel.typing():
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            except Exception as e:
+                await message.reply(f"Assigned `{province_id}` to {display_name} (render failed: {e}).")
+                return
+
+        self.flog.log_command("mapset", str(message.author), message.channel.name, arg)
+        await message.reply(
+            f"Assigned `{province_id}` to **{display_name}**.",
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+        )
+
+    async def _cmd_maprelease(self, message: discord.Message, province_id: str) -> None:
+        """!DNC maprelease PROVINCE_ID — release province ownership."""
+        province_id = province_id.strip().upper()
+        if not province_id:
+            await message.reply(f"Usage: `{self.prefix} maprelease PROVINCE_ID`")
+            return
+
+        removed = self.province_store.release(province_id)
+        if not removed:
+            await message.reply(f"`{province_id}` has no current owner.")
+            return
+
+        async with message.channel.typing():
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            except Exception as e:
+                await message.reply(f"Released `{province_id}` (render failed: {e}).")
+                return
+
+        self.flog.log_command("maprelease", str(message.author), message.channel.name, province_id)
+        await message.reply(
+            f"Released `{province_id}` — now uncontrolled.",
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+        )
+
+    async def _cmd_maplist(self, message: discord.Message, tag: str) -> None:
+        """!DNC maplist [TAG] — list provinces and their owners."""
+        tag = tag.strip().upper() if tag.strip() else ""
+
+        if tag:
+            provinces = self.province_store.list_by_country(tag)
+            if not provinces:
+                await message.reply(
+                    f"`{tag}` has no provinces defined. "
+                    f"Use `{self.prefix} mapdivide {tag} N` to subdivide it."
+                )
+                return
+            ownership = self.province_store.get_ownership()
+            lines = [f"**Provinces of {tag}** ({len(provinces)} total):\n"]
+            for p in provinces:
+                o = ownership.get(p.id)
+                owner_str = f"**{o.display_name}** ({o.player_tag})" if o else "*uncontrolled*"
+                lines.append(f"`{p.id}` — {owner_str}")
+            await message.reply("\n".join(lines))
+        else:
+            subdivided = self.province_store.subdivided_tags()
+            if not subdivided:
+                await message.reply("No countries are currently subdivided into provinces.")
+                return
+            lines = [f"**Subdivided countries** ({len(subdivided)}):\n"]
+            for t in sorted(subdivided):
+                n = len(self.province_store.list_by_country(t))
+                lines.append(f"`{t}` — {n} provinces")
+            await message.reply("\n".join(lines))
+
+    async def _cmd_mapparse(self, message: discord.Message, arg: str) -> None:
+        """!DNC mapparse <message-link> — LLM reads a post and proposes ownership changes."""
+        arg = arg.strip()
+        m = MSG_LINK_RE.search(arg)
+        if not m:
+            await message.reply(
+                f"Usage: `{self.prefix} mapparse <discord-message-link>`"
+            )
+            return
+
+        guild_id, channel_id, msg_id = m.group(1), m.group(2), m.group(3)
+        try:
+            target_channel = self.get_channel(int(channel_id))
+            if target_channel is None:
+                await message.reply("Cannot access that channel.")
+                return
+            target_msg = await target_channel.fetch_message(int(msg_id))
+        except discord.NotFound:
+            await message.reply("Message not found.")
+            return
+        except Exception as e:
+            await message.reply(f"Failed to fetch message: {e}")
+            return
+
+        post_text = target_msg.content or ""
+        if not post_text:
+            await message.reply("That message has no text content.")
+            return
+
+        subdivided = self.province_store.subdivided_tags()
+        if not subdivided:
+            await message.reply(
+                "No provinces are defined yet. "
+                f"Use `{self.prefix} mapdivide TAG N` to create some first."
+            )
+            return
+
+        ownership = self.province_store.get_ownership()
+        defs = self.province_store.all_definitions()
+        province_context = {
+            pid: {
+                "parent_tag": p.parent_tag,
+                "name": p.name,
+                "owner": ownership[pid].display_name if pid in ownership else None,
+            }
+            for pid, p in defs.items()
+        }
+
+        map_cfg = self.cfg.get("spatial_mapping", {})
+        model = map_cfg.get("map_llm_model") or None
+
+        async with message.channel.typing():
+            try:
+                changes = await map_llm.parse_post_for_changes(
+                    post_text, province_context, self.llm, model=model
+                )
+            except Exception as e:
+                await message.reply(f"LLM analysis failed: {e}")
+                return
+
+        summary = map_llm.format_change_summary(changes, self.province_store)
+        confirm_msg = await message.reply(summary)
+
+        if not changes:
+            return
+
+        await confirm_msg.add_reaction("✅")
+        await confirm_msg.add_reaction("❌")
+
+        def _check(reaction, user):
+            return (
+                reaction.message.id == confirm_msg.id
+                and str(reaction.emoji) in ("✅", "❌")
+                and self._is_admin_user_by_id(user, message.guild)
+            )
+
+        try:
+            reaction, _ = await self.wait_for("reaction_add", timeout=60.0, check=_check)
+        except asyncio.TimeoutError:
+            await confirm_msg.reply("Timed out — no changes applied.")
+            return
+
+        if str(reaction.emoji) == "❌":
+            await confirm_msg.reply("Cancelled — no changes applied.")
+            return
+
+        applied, errors = 0, []
+        for ch in changes:
+            action = ch.get("action")
+            pid = ch.get("province_id", "").upper()
+            try:
+                if action == "assign_province":
+                    player_tag = ch.get("player_tag", "").upper()
+                    self.province_store.assign(pid, player_tag, "", player_tag)
+                    applied += 1
+                elif action == "release_province":
+                    self.province_store.release(pid)
+                    applied += 1
+                elif action == "transfer_province":
+                    to_tag = ch.get("to_tag", "").upper()
+                    self.province_store.assign(pid, to_tag, "", to_tag)
+                    applied += 1
+            except Exception as e:
+                errors.append(f"`{pid}`: {e}")
+
+        self.flog.log_command("mapparse", str(message.author), message.channel.name, arg)
+
+        result_lines = [f"Applied **{applied}** change(s)."]
+        if errors:
+            result_lines.append("Errors: " + "; ".join(errors))
+
+        async with message.channel.typing():
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                await confirm_msg.reply(
+                    "\n".join(result_lines),
+                    file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+                )
+            except Exception as e:
+                await confirm_msg.reply("\n".join(result_lines) + f"\n(Render failed: {e})")
+
+    # ------------------------------------------------------------------
     async def close(self):
         for task in list(self._pending_timers.values()):
             task.cancel()
@@ -1930,6 +2394,8 @@ class LoreBot(commands.Bot):
         self._pending_timers.clear()
         if self._rollover_task.is_running():
             self._rollover_task.cancel()
+        if self._map_render_task.is_running():
+            self._map_render_task.cancel()
         await self.llm.close()
         if self.tavily:
             await self.tavily.close()
@@ -2057,6 +2523,43 @@ class LoreCog(commands.Cog):
         if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
         self.bot.flog.log_command("chatunban", str(ctx.author), ctx.channel.name, arg)
         await self.bot._cmd_chatunban(ctx.message, arg)
+
+    @commands.command(name="map")
+    async def map(self, ctx: commands.Context):
+        await self.bot._cmd_map(ctx.message)
+
+    @commands.command(name="mapzoom")
+    async def mapzoom(self, ctx: commands.Context, *, tag: str = ""):
+        await self.bot._cmd_mapzoom(ctx.message, tag)
+
+    @commands.command(name="mapdivide")
+    async def mapdivide(self, ctx: commands.Context, *, arg: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_mapdivide(ctx.message, arg)
+
+    @commands.command(name="mapmerge")
+    async def mapmerge(self, ctx: commands.Context, *, tag: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_mapmerge(ctx.message, tag)
+
+    @commands.command(name="mapset")
+    async def mapset(self, ctx: commands.Context, *, arg: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_mapset(ctx.message, arg)
+
+    @commands.command(name="maprelease")
+    async def maprelease(self, ctx: commands.Context, *, province_id: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_maprelease(ctx.message, province_id)
+
+    @commands.command(name="maplist")
+    async def maplist(self, ctx: commands.Context, *, tag: str = ""):
+        await self.bot._cmd_maplist(ctx.message, tag)
+
+    @commands.command(name="mapparse")
+    async def mapparse(self, ctx: commands.Context, *, arg: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_mapparse(ctx.message, arg)
 
 
 def main():

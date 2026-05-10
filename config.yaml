@@ -1,5 +1,5 @@
 # =====================================================================
-# DNC Lore Bot — configuration (v0.6)
+# DNC Lore Bot — configuration (v0.8)
 # =====================================================================
 
 bot:
@@ -28,7 +28,7 @@ bot:
     announcement_channels:
       - "announcements"
     announcement_template: |
-      📜 **The year turns. It is now {year}.**
+        **It is now {year}.**
     year_check_channel: ""
 
 discord:
@@ -83,11 +83,11 @@ models:
     # LLM provider — any OpenAI-compatible API (OpenRouter, HuggingFace TGI, vLLM, etc.)
     base_url: "https://openrouter.ai/api/v1"
     # Optional headers forwarded to the provider (used by OpenRouter for attribution)
-    site_url: "https://github.com/your-repo"
+    site_url: "github.com/Shadowknight908/DNCbot"
     site_name: "DNC Lore Bot"
     # Embeddings provider — can be the same or a different endpoint.
     # Falls back to base_url if not set. Set EMBEDDING_API_KEY in .env for a separate key.
-    embedding_base_url: "https://openrouter.ai/api/v1/"
+    embedding_base_url: ""
   
   # Default settings used when a mode field is left blank.
   defaults:
@@ -114,7 +114,7 @@ models:
       top_p:
       top_k:
       max_tokens:
-      thinking_budget: none
+      thinking_budget:
     query:
       model: z-ai/glm-5.1
       temperature: 0.7
@@ -135,7 +135,7 @@ models:
       top_p:
       top_k:
       max_tokens:
-      thinking_budget: none
+      thinking_budget:
 
 # --- PERSISTENCE ---
 memory:
@@ -158,9 +158,49 @@ chat_blacklist_file: "chat_blacklist.txt"
 tavily:
   enabled_modes:
     chat: true
-    chatuc: true
+    chatuc: false
   max_results: 5
   search_depth: "basic"   # "basic" or "advanced"
+
+# --- SPATIAL MAPPING ---
+spatial_mapping:
+  enabled: true
+  # Channel where auto-rendered maps are posted.
+  output_channel: "maps"
+  # How often to auto-render and post a new map (hours).
+  update_interval_hours: 24
+  # Degrees of padding added around the target country for !DNC mapzoom.
+  zoom_buffer_deg: 5.0
+  # Path where auto-generated province definitions are stored.
+  province_data_path: "map_data/provinces.json"
+  # Path where province ownership state is persisted.
+  province_ownership_path: "province_ownership.json"
+  # Model for !DNC mapparse LLM analysis. null = use models.defaults.model.
+  map_llm_model: null
+  # Ordered hex palette. Colors are assigned to tags in this order as nations
+  # are first occupied; released and re-assigned fresh when a tag becomes vacant.
+  # Edit this list to customize nation colors.
+  color_palette:
+    - "#e63946"
+    - "#457b9d"
+    - "#2a9d8f"
+    - "#e9c46a"
+    - "#f4a261"
+    - "#6a4c93"
+    - "#1982c4"
+    - "#8ac926"
+    - "#ff595e"
+    - "#ffca3a"
+    - "#06d6a0"
+    - "#118ab2"
+    - "#ef476f"
+    - "#ffd166"
+    - "#3a0ca3"
+    - "#4cc9f0"
+    - "#f72585"
+    - "#7209b7"
+    - "#560bad"
+    - "#480ca8"
 
 # --- SYSTEM PROMPTS ---
 prompts:

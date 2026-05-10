@@ -152,7 +152,13 @@ class InferenceClient:
             f"{self._base_url}/chat/completions",
             json=payload,
         ) as resp:
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                body = await resp.aread()
+                raise httpx.HTTPStatusError(
+                    f"{resp.status_code} {resp.reason_phrase}: {body.decode(errors='replace')}",
+                    request=resp.request,
+                    response=resp,
+                )
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
                     continue
