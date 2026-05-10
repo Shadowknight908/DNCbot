@@ -64,6 +64,7 @@ def subdivide_country(
 
     # North-to-south, west-to-east ordering for intuitive numbering
     cells.sort(key=lambda c: (-c[0], c[1]))
+    cells = cells[:n]  # enforce requested count (grid may produce cols*rows > n)
 
     pad = max(2, len(str(len(cells))))
     provinces: list[Province] = []

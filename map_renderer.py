@@ -24,6 +24,7 @@ from io import BytesIO
 from typing import Optional
 
 import warnings
+from collections import defaultdict
 
 import matplotlib
 matplotlib.use("Agg")
@@ -317,47 +318,71 @@ def _add_province_layer(
     province_definitions: dict,
     province_ownership: dict,
     subdivided_tags: set[str],
+    occupation: Optional[dict] = None,
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     fontsize: int = 4,
+    show_labels: bool = True,
 ) -> None:
-    """Draw province cells (Layer 1) and their labels (Layer 2a) for subdivided nations."""
+    """Draw province cells (Layer 1) and their labels (Layer 2a) for subdivided nations.
+
+    Colors fall back to the parent country's occupation color when no province
+    owner exists, so freshly-subdivided countries keep their nation color.
+    Provinces are batched by color for efficient rendering of large subdivision counts.
+    Labels are suppressed on the world map (show_labels=False) and visible on zoom.
+    """
     if not province_definitions:
         return
+
+    occ = occupation or {}
+
+    # Collect renderable provinces, resolving fill color once per province.
+    color_groups: dict[str, list] = defaultdict(list)
+    label_items: list[tuple[float, float, str, object]] = []  # (cx, cy, label, ownership)
 
     for pid, prov in province_definitions.items():
         tag = prov.parent_tag
         if tag not in subdivided_tags:
             continue
 
-        ownership = province_ownership.get(pid)
-        fill = ownership.color if ownership else UNOCCUPIED_COLOR
-
-        try:
-            geom = shape(prov.geometry)
-        except Exception:
-            continue
-
-        # Clip check: skip if centroid is outside view bounds
         cx, cy = prov.centroid
         if xlim and not (xlim[0] <= cx <= xlim[1]):
             continue
         if ylim and not (ylim[0] <= cy <= ylim[1]):
             continue
 
-        prov_gdf = gpd.GeoDataFrame(geometry=[geom], crs="EPSG:4326")
-        prov_gdf.plot(
+        try:
+            geom = shape(prov.geometry)
+        except Exception:
+            continue
+
+        ownership = province_ownership.get(pid)
+        if ownership:
+            fill = ownership.color
+        elif tag in occ:
+            fill = occ[tag].color
+        else:
+            fill = UNOCCUPIED_COLOR
+
+        color_groups[fill].append(geom)
+
+        if show_labels:
+            label = pid
+            if ownership:
+                label += f"\n{ownership.display_name[:12]}"
+            label_items.append((cx, cy, label, ownership))
+
+    # Batch plot all provinces sharing the same color in one GeoDataFrame call.
+    for color, geoms in color_groups.items():
+        gpd.GeoDataFrame(geometry=geoms, crs="EPSG:4326").plot(
             ax=ax,
-            color=fill,
+            color=color,
             edgecolor=_PROVINCE_BORDER_COLOR,
             linewidth=0.3,
             alpha=0.85,
         )
 
-        # Province label: ID on first line, player name on second if owned
-        label = pid
-        if ownership:
-            label += f"\n{ownership.display_name[:12]}"
+    for cx, cy, label, _ in label_items:
         ax.annotate(
             label,
             xy=(cx, cy),
@@ -417,7 +442,10 @@ def _render_world_sync(
     ax.set_facecolor(_OCEAN_COLOR)
     world.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.4)
 
-    _add_province_layer(ax, province_definitions, province_ownership, subdivided_tags, fontsize=4)
+    _add_province_layer(
+        ax, province_definitions, province_ownership, subdivided_tags,
+        occupation=occupation, fontsize=4, show_labels=False,
+    )
     _add_labels(ax, world, occupation, subdivided_tags=subdivided_tags, fontsize=5)
 
     ax.set_axis_off()
@@ -466,7 +494,7 @@ def _render_zoom_sync(
 
     _add_province_layer(
         ax, province_definitions, province_ownership, subdivided_tags,
-        xlim=xlim, ylim=ylim, fontsize=6,
+        occupation=occupation, xlim=xlim, ylim=ylim, fontsize=6, show_labels=True,
     )
     _add_labels(
         ax, world, occupation,

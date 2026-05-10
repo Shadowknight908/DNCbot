@@ -2103,8 +2103,8 @@ class LoreBot(commands.Bot):
             )
             return
         tag, n = parts[0], int(parts[1])
-        if n < 2 or n > 100:
-            await message.reply("Province count must be between 2 and 100.")
+        if n < 2 or n > 500:
+            await message.reply("Province count must be between 2 and 500.")
             return
 
         features = self._geojson_features_for_tag(tag)
