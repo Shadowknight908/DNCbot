@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import urllib.request
 from functools import partial
@@ -37,6 +38,7 @@ from matplotlib.patches import Patch
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import shape
+from shapely.ops import transform as shapely_transform
 
 import arcgis_provinces
 from faction_store import FactionMembership
@@ -460,8 +462,7 @@ def _add_province_layer(
     fontsize: int = 4,
     show_labels: bool = False,
     crs: Optional[str] = None,
-    geo_xlim: Optional[tuple[float, float]] = None,
-    geo_ylim: Optional[tuple[float, float]] = None,
+    lon_0: Optional[float] = None,
 ) -> None:
     """Draw real ArcGIS province divisions (always visible).
 
@@ -470,31 +471,38 @@ def _add_province_layer(
       2. Parent country occupation color (if the owning game tag is in occupation)
       3. UNOCCUPIED_COLOR
 
+    Modes:
+      - crs set (world map): reproject all provinces to crs.
+      - lon_0 set (zoom map): shift each province's geometry by ±360° per part
+        so its centroid lies in (lon_0-180, lon_0+180]. Provinces are filtered
+        by shifted centroid against xlim/ylim, then plotted in plain geographic
+        coordinates. Keeps north straight up everywhere.
+      - neither: plot in raw geographic coords, filter by xlim/ylim.
+
     On the world map labels are suppressed (show_labels=False); on zoom they show.
-    A single GeoDataFrame.plot() call handles all provinces for performance.
-    When crs is set the GDF is reprojected (world map); otherwise geographic
-    coordinates are used with xlim/ylim spatial filtering (zoom map).
-    geo_xlim/geo_ylim filter provinces by geographic centroid BEFORE reprojection
-    (used on zoom maps to avoid reprojecting the full global province set).
     """
     gdf = _province_gdf()
     if gdf.empty:
         return
 
     if crs:
-        # Geographic pre-filter before reprojection for performance
-        if geo_xlim or geo_ylim:
-            mask = pd.Series(True, index=gdf.index)
-            if geo_xlim:
-                mask &= gdf["cx"].between(geo_xlim[0], geo_xlim[1])
-            if geo_ylim:
-                mask &= gdf["cy"].between(geo_ylim[0], geo_ylim[1])
-            gdf = gdf[mask]
+        gdf = gdf.to_crs(crs)
+    elif lon_0 is not None:
+        shifts = gdf["cx"].apply(lambda lon: _lon_shift_amount(lon, lon_0))
+        shifted_cx = gdf["cx"] + shifts
+        mask = pd.Series(True, index=gdf.index)
+        if xlim:
+            mask &= shifted_cx.between(xlim[0], xlim[1])
+        if ylim:
+            mask &= gdf["cy"].between(ylim[0], ylim[1])
+        gdf = gdf[mask].copy()
         if gdf.empty:
             return
-        gdf = gdf.to_crs(crs)
+        gdf["__shifted_cx"] = shifted_cx[mask]
+        gdf["geometry"] = gdf.geometry.apply(
+            lambda g: _shift_geom_to_window(g, lon_0)
+        )
     elif xlim or ylim:
-        # Spatial filter for zoom maps (geographic coords)
         mask = pd.Series(True, index=gdf.index)
         if xlim:
             mask &= gdf["cx"].between(xlim[0], xlim[1])
@@ -538,6 +546,8 @@ def _add_province_layer(
             if crs:
                 centroid = row.geometry.centroid
                 cx, cy = centroid.x, centroid.y
+            elif lon_0 is not None:
+                cx, cy = row["__shifted_cx"], row["cy"]
             else:
                 cx, cy = row["cx"], row["cy"]
             ax.annotate(
@@ -675,6 +685,43 @@ def _render_faction_world_sync(
     return buf.read()
 
 
+def _lon_shift_amount(lon: float, lon_0: float) -> float:
+    """Return the multiple of 360° to add to `lon` so it falls in (lon_0-180, lon_0+180]."""
+    shift = 0.0
+    while lon + shift <= lon_0 - 180.0:
+        shift += 360.0
+    while lon + shift > lon_0 + 180.0:
+        shift -= 360.0
+    return shift
+
+
+def _shift_geom_to_window(geom, lon_0: float):
+    """Shift each part of a (multi-)geometry so its centroid lies in (lon_0-180, lon_0+180].
+
+    Each polygon/part is shifted as a whole by a multiple of 360° based on its own
+    centroid, so antimeridian-spanning countries (Russia, USA Aleutians, Fiji) end
+    up rendered as one contiguous body rather than smeared across the canvas.
+    """
+    if geom is None or geom.is_empty:
+        return geom
+
+    def _apply(g, shift):
+        if shift == 0.0:
+            return g
+        return shapely_transform(
+            lambda x, y, z=None: (x + shift, y) if z is None else (x + shift, y, z),
+            g,
+        )
+
+    if hasattr(geom, "geoms"):
+        parts = [
+            _apply(part, _lon_shift_amount(part.centroid.x, lon_0))
+            for part in geom.geoms
+        ]
+        return type(geom)(parts)
+    return _apply(geom, _lon_shift_amount(geom.centroid.x, lon_0))
+
+
 def _geographic_center_lon(target: gpd.GeoDataFrame) -> float:
     """Area-weighted projection-centre longitude, with antimeridian adjustment.
 
@@ -727,64 +774,58 @@ def _render_zoom_sync(
     if target.empty:
         raise ValueError(f"Country '{name}' not found in 1970 map dataset")
 
-    # Geographic bounds in EPSG:4326
-    geo_bounds = target.total_bounds  # (minx, miny, maxx, maxy)
+    # Area-weighted, antimeridian-aware central longitude. Used as the centre of
+    # a (lon_0-180, lon_0+180] window into which every polygon part is shifted
+    # by a whole number of 360°.
+    lon_0 = _geographic_center_lon(target)
 
-    lat_0 = round((geo_bounds[1] + geo_bounds[3]) / 2, 4)
-    lat_0 = max(-89.0, min(89.0, lat_0))  # avoid aeqd singularity at poles
-    lon_0 = round(_geographic_center_lon(target), 4)
+    # Plate-carrée style: shift each polygon part by ±360° based on its centroid
+    # so antimeridian-crossing countries (Russia, USA Aleutians) stay contiguous,
+    # then plot in raw (lon, lat) so meridians are vertical and north is up
+    # everywhere on the canvas — including at high latitudes (no aeqd rotation).
+    world_shifted = world.copy()
+    world_shifted["geometry"] = world_shifted.geometry.apply(
+        lambda g: _shift_geom_to_window(g, lon_0)
+    )
+    target_shifted = world_shifted[world_shifted["NAME"] == name]
 
-    # Local azimuthal equidistant projection centered on the country.
-    # Correctly wraps antimeridian-spanning geometries (Russia, etc.).
-    local_crs = (
-        f"+proj=aeqd +lat_0={lat_0} +lon_0={lon_0} "
-        "+datum=WGS84 +units=m +no_defs"
+    bounds = target_shifted.total_bounds  # (minx, miny, maxx, maxy) in shifted lon, lat
+    xlim = (bounds[0] - buffer_deg, bounds[2] + buffer_deg)
+    ylim = (
+        max(-90.0, bounds[1] - buffer_deg),
+        min(90.0, bounds[3] + buffer_deg),
     )
 
-    world_proj = world.to_crs(local_crs)
-    target_proj = world_proj[world_proj["NAME"] == name]
-    colors = _fill_colors(world_proj, occupation)
+    # Aspect: at latitude L, 1° lon ≈ cos(L)° lat in km. set_aspect(N) makes
+    # one y-unit visually N times one x-unit, so N = 1/cos(L) gives correct
+    # land shape at the target's centre latitude. Clamps avoid singularity
+    # near the poles and divide-by-zero.
+    lat_center = max(-85.0, min(85.0, (ylim[0] + ylim[1]) / 2.0))
+    aspect = 1.0 / max(0.1, math.cos(math.radians(lat_center)))
 
-    # Bounds in projected meters; convert buffer from degrees (≈111 km/°)
-    bounds = target_proj.total_bounds
-    buf_m = buffer_deg * 111_000
-    xlim = (bounds[0] - buf_m, bounds[2] + buf_m)
-    ylim = (bounds[1] - buf_m, bounds[3] + buf_m)
-
-    # Geographic pre-filter for province layer — skip lon pre-filter for
-    # antimeridian-spanning countries (their cx values may scatter across ±180°)
-    geo_pad = buffer_deg + 5
-    geo_xlim: Optional[tuple[float, float]] = (
-        max(-180.0, geo_bounds[0] - geo_pad),
-        min(180.0, geo_bounds[2] + geo_pad),
-    )
-    geo_ylim: Optional[tuple[float, float]] = (
-        max(-90.0, geo_bounds[1] - geo_pad),
-        min(90.0, geo_bounds[3] + geo_pad),
-    )
-    if geo_bounds[2] - geo_bounds[0] > 150:
-        geo_xlim = None  # antimeridian-crossing country — lat filter is enough
+    colors = _fill_colors(world_shifted, occupation)
 
     fig, ax = plt.subplots(1, 1, figsize=(16, 10), facecolor=_OCEAN_COLOR)
     ax.set_facecolor(_OCEAN_COLOR)
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
+    ax.set_aspect(aspect)
 
-    # Layer 0: base nation fills (local projection)
-    world_proj.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
+    # Layer 0: base nation fills in shifted geographic coords
+    world_shifted.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
 
-    # Layer 1: province subdivisions with labels at zoom scale
+    # Layer 1: province subdivisions, longitude-shifted to the same window
     _add_province_layer(
         ax, province_ownership, occupation,
-        fontsize=6, show_labels=True, crs=local_crs,
-        geo_xlim=geo_xlim, geo_ylim=geo_ylim,
+        xlim=xlim, ylim=ylim,
+        fontsize=6, show_labels=True, lon_0=lon_0,
     )
 
     # Layer 2: highlighted target country border redrawn on top
-    target_proj.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.5)
+    target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.5)
 
-    # Layer 3: country labels (centroids in projected coords)
-    _add_labels(ax, world_proj, occupation, xlim=xlim, ylim=ylim, fontsize=7)
+    # Layer 3: country labels (centroids of shifted geometries)
+    _add_labels(ax, world_shifted, occupation, xlim=xlim, ylim=ylim, fontsize=7)
 
     ax.set_axis_off()
 
