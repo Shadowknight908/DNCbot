@@ -675,6 +675,42 @@ def _render_faction_world_sync(
     return buf.read()
 
 
+def _geographic_center_lon(target: gpd.GeoDataFrame) -> float:
+    """Area-weighted projection-centre longitude, with antimeridian adjustment.
+
+    Handles two failure modes of simple bounding-box midpoints:
+    - Countries split at ±180° (Russia, Fiji, NZ): bbox midpoint ≈ 0°.
+    - Countries with many tiny remote island parts (USA Aleutians): bbox
+      midpoint is pulled far from the main body by the extreme minx/maxx.
+
+    Finds the area-weighted median longitude as an anchor, shifts any parts
+    that straddle the antimeridian, then returns the area-weighted mean.
+    """
+    parts = target.explode(index_parts=False)
+    pairs = [(float(p.centroid.x), float(p.area)) for p in parts.geometry]
+
+    pairs_sorted = sorted(pairs, key=lambda t: t[0])
+    total_area = sum(a for _, a in pairs_sorted) or 1.0
+
+    # Area-weighted median — robust anchor for antimeridian detection
+    cum = 0.0
+    anchor = pairs_sorted[0][0]
+    for lon, area in pairs_sorted:
+        cum += area
+        if cum >= total_area / 2:
+            anchor = lon
+            break
+
+    # Shift parts that are >180° from the anchor (antimeridian wrap)
+    adj_pairs = [
+        (lon + 360 if lon < anchor - 180 else lon - 360 if lon > anchor + 180 else lon, area)
+        for lon, area in pairs
+    ]
+
+    lon_0 = sum(lon * area for lon, area in adj_pairs) / total_area
+    return ((lon_0 + 180) % 360) - 180
+
+
 def _render_zoom_sync(
     iso_tag: str,
     occupation: dict[str, OccupiedNation],
@@ -696,23 +732,7 @@ def _render_zoom_sync(
 
     lat_0 = round((geo_bounds[1] + geo_bounds[3]) / 2, 4)
     lat_0 = max(-89.0, min(89.0, lat_0))  # avoid aeqd singularity at poles
-
-    lon_span = geo_bounds[2] - geo_bounds[0]
-    if lon_span > 340:
-        # Country is split at the antimeridian (e.g. Soviet Union: bounds ≈ −180 to +180).
-        # total_bounds midpoint ≈ 0°E is meaningless; derive centre from polygon-part centroids.
-        parts = target.explode(index_parts=False)
-        part_lons = sorted(float(p.centroid.x) for p in parts.geometry)
-        median_lon = part_lons[len(part_lons) // 2]
-        adj = [
-            x + 360 if x < median_lon - 180 else
-            x - 360 if x > median_lon + 180 else
-            x
-            for x in part_lons
-        ]
-        lon_0 = round(((sum(adj) / len(adj) + 180) % 360) - 180, 4)
-    else:
-        lon_0 = round((geo_bounds[0] + geo_bounds[2]) / 2, 4)
+    lon_0 = round(_geographic_center_lon(target), 4)
 
     # Local azimuthal equidistant projection centered on the country.
     # Correctly wraps antimeridian-spanning geometries (Russia, etc.).
