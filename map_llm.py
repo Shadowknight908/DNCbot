@@ -134,6 +134,7 @@ async def parse_post_for_changes(
     province_context: dict,
     client: Any,
     model: Optional[str] = None,
+    tavily: Any = None,
 ) -> list[dict]:
     """Call the LLM to identify territorial changes in post_text.
 
@@ -146,10 +147,16 @@ async def parse_post_for_changes(
     proposals: list[dict] = []
 
     async def _collect(name: str, args: dict) -> str:
+        if name == "web_search" and tavily is not None:
+            return await tavily.execute(name, args)
         proposal = {"action": name, **args}
         proposals.append(proposal)
         log.info("Map LLM proposed: %s %s", name, args.get("province_id", ""))
         return json.dumps({"status": "recorded"})
+
+    tools = list(TOOL_DEFINITIONS)
+    if tavily is not None:
+        tools.append(tavily.tool_definition())
 
     province_text = _build_province_context_text(province_context)
     user_message = f"{province_text}\n\n---\nRoleplay post to analyze:\n{post_text}"
@@ -161,12 +168,77 @@ async def parse_post_for_changes(
                 {"role": "user", "content": user_message},
             ],
             model=model,
-            tools=TOOL_DEFINITIONS,
+            tools=tools,
             tool_executor=_collect,
             temperature=0.0,
         )
     except Exception as e:
         log.error("map_llm: LLM call failed: %s", e, exc_info=True)
+        raise
+
+    return proposals
+
+
+_INSTRUCTION_SYSTEM_PROMPT = """\
+You are a map administrator for a 1970s Cold War roleplay game. \
+You receive direct instructions from a game master describing territorial changes to apply. \
+Execute the instructions exactly as given by calling the appropriate tool for each province affected:
+- assign_province: set a province's owner to a specific player/nation tag
+- release_province: make a province uncontrolled (no owner)
+- transfer_province: move a province from one owner to another
+
+You have been given a complete list of province IDs grouped by country. \
+Only use IDs that appear in that list — do not invent province IDs. \
+If the instructions name a region or state (e.g. "Bavaria", "Alaska"), find the matching province ID in the list. \
+If an instruction covers multiple provinces, call the tool for each one individually. \
+Include a short reason for each change drawn from the instructions.\
+"""
+
+
+async def process_map_instructions(
+    instructions: str,
+    province_context: dict,
+    client: Any,
+    model: Optional[str] = None,
+    tavily: Any = None,
+) -> list[dict]:
+    """Call the LLM to execute direct map-change instructions.
+
+    Unlike parse_post_for_changes (which infers changes from RP narrative),
+    this accepts explicit administrator commands such as
+    "Assign Bavaria to FRG and release Hamburg."
+
+    Returns proposed changes for admin confirmation — NOT applied yet.
+    """
+    proposals: list[dict] = []
+
+    async def _collect(name: str, args: dict) -> str:
+        if name == "web_search" and tavily is not None:
+            return await tavily.execute(name, args)
+        proposals.append({"action": name, **args})
+        log.info("Map instruction LLM proposed: %s %s", name, args.get("province_id", ""))
+        return json.dumps({"status": "recorded"})
+
+    tools = list(TOOL_DEFINITIONS)
+    if tavily is not None:
+        tools.append(tavily.tool_definition())
+
+    province_text = _build_province_context_text(province_context)
+    user_message = f"{province_text}\n\n---\nMap change instructions:\n{instructions}"
+
+    try:
+        await client.chat_messages(
+            messages=[
+                {"role": "system", "content": _INSTRUCTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_message},
+            ],
+            model=model,
+            tools=tools,
+            tool_executor=_collect,
+            temperature=0.0,
+        )
+    except Exception as e:
+        log.error("map_llm.process_map_instructions: LLM call failed: %s", e, exc_info=True)
         raise
 
     return proposals

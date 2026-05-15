@@ -1,1 +1,194 @@
-{}
+{
+  "US-CA": {
+    "province_id": "US-CA",
+    "player_tag": "USA",
+    "user_id": "",
+    "display_name": "USA",
+    "color": "#e63946",
+    "since": "2026-05-10T04:21:01.144664+00:00"
+  },
+  "CY-01": {
+    "province_id": "CY-01",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.554509+00:00"
+  },
+  "CY-02": {
+    "province_id": "CY-02",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.555126+00:00"
+  },
+  "CY-03": {
+    "province_id": "CY-03",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.555449+00:00"
+  },
+  "CY-04": {
+    "province_id": "CY-04",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.555584+00:00"
+  },
+  "CY-05": {
+    "province_id": "CY-05",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.555749+00:00"
+  },
+  "CY-06": {
+    "province_id": "CY-06",
+    "player_tag": "GRC",
+    "user_id": "",
+    "display_name": "GRC",
+    "color": "#457b9d",
+    "since": "2026-05-10T04:28:47.556004+00:00"
+  },
+  "DE-BW": {
+    "province_id": "DE-BW",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.204724+00:00"
+  },
+  "DE-BY": {
+    "province_id": "DE-BY",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.204965+00:00"
+  },
+  "DE-HB": {
+    "province_id": "DE-HB",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.205278+00:00"
+  },
+  "DE-HE": {
+    "province_id": "DE-HE",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.205514+00:00"
+  },
+  "DE-HH": {
+    "province_id": "DE-HH",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.205751+00:00"
+  },
+  "DE-NI": {
+    "province_id": "DE-NI",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.206248+00:00"
+  },
+  "DE-NW": {
+    "province_id": "DE-NW",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.206505+00:00"
+  },
+  "DE-RP": {
+    "province_id": "DE-RP",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.206744+00:00"
+  },
+  "DE-SH": {
+    "province_id": "DE-SH",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.206979+00:00"
+  },
+  "DE-SL": {
+    "province_id": "DE-SL",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.207700+00:00"
+  },
+  "DE-BE": {
+    "province_id": "DE-BE",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.204418+00:00"
+  },
+  "RU-AD": {
+    "province_id": "RU-AD",
+    "player_tag": "USSR",
+    "user_id": "",
+    "display_name": "USSR",
+    "color": "#6a4c93",
+    "since": "2026-05-10T04:48:20.639419+00:00"
+  },
+  "DE-BB": {
+    "province_id": "DE-BB",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.203934+00:00"
+  },
+  "DE-MV": {
+    "province_id": "DE-MV",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.205983+00:00"
+  },
+  "DE-SN": {
+    "province_id": "DE-SN",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.208043+00:00"
+  },
+  "DE-ST": {
+    "province_id": "DE-ST",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.208445+00:00"
+  },
+  "DE-TH": {
+    "province_id": "DE-TH",
+    "player_tag": "ISR",
+    "user_id": "",
+    "display_name": "ISR",
+    "color": "#f72585",
+    "since": "2026-05-14T01:42:24.208777+00:00"
+  }
+}

@@ -9,6 +9,11 @@ state.json
 optouts.txt
 chat_blacklist.txt
 voided_memories.jsonl
+writeup.md
+
+# Generated province cache (rebuilt from World_Administrative_Divisions.geojson on first run)
+map_data/arcgis_provinces_merged.geojson
+province_ownership.json
 
 # Python
 __pycache__/

@@ -15,6 +15,7 @@ import io
 import json
 import logging
 import os
+import random
 import re
 import sys
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from channel_names import (
     sanitize_channel_list,
     emit_warnings,
 )
+from espionage_store import EspionageStore
 from chat_blacklist import ChatBlacklist
 from inference_client import InferenceClient
 from file_logging import FileLoggers
@@ -42,6 +44,7 @@ import reply_chain
 import year_scheduler
 
 from map_colors import MapColorStore
+from faction_store import FactionStore
 from map_store import MapStore
 import map_renderer
 import map_scheduler as map_sched
@@ -105,6 +108,60 @@ def parse_void_target(arg: str):
     return "unknown", {}
 
 
+_DOC_CONTENT_TYPES = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+}
+_DOC_CHUNK_CHARS = 4500
+_DOC_CHUNK_OVERLAP = 400
+_ARCHIVIST_INPUT_CHARS = 60000
+_EMBED_INPUT_CHARS = 30000
+_GM_PRIOR_CONTEXT_CHARS = 120000
+_GM_WIDER_CONTEXT_CHARS = 100000
+_GM_CONTEXT_ITEM_CHARS = 30000
+
+
+def _doc_attachment_type(a: discord.Attachment) -> str | None:
+    """Return 'pdf' or 'docx' if the attachment looks like a document, else None."""
+    ct = (a.content_type or "").lower().split(";")[0].strip()
+    if ct in _DOC_CONTENT_TYPES:
+        return _DOC_CONTENT_TYPES[ct]
+    fn = (a.filename or "").lower()
+    if fn.endswith(".pdf"):
+        return "pdf"
+    if fn.endswith(".docx"):
+        return "docx"
+    return None
+
+
+def _collapse_blank_lines(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _trim_context_text(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n\n[... truncated after {limit} chars ...]"
+
+
+def _iter_text_chunks(text: str, chunk_chars: int = _DOC_CHUNK_CHARS,
+                      overlap: int = _DOC_CHUNK_OVERLAP):
+    clean = _collapse_blank_lines(text)
+    if not clean:
+        return
+    start = 0
+    while start < len(clean):
+        end = min(len(clean), start + chunk_chars)
+        yield clean[start:end].strip()
+        if end >= len(clean):
+            break
+        start = max(0, end - overlap)
+
+
 # ----------------------------------------------------------------------
 class LoreBot(commands.Bot):
     def __init__(self, config: dict):
@@ -152,6 +209,18 @@ class LoreBot(commands.Bot):
             if r and isinstance(r, str)
         }
 
+        # Espionage channel sets
+        esp_cfg = config.get("espionage", {})
+        esp_cmd_raw, _ = sanitize_channel_list(
+            esp_cfg.get("command_channels", []), "espionage_command_channels"
+        )
+        esp_sec_raw, _ = sanitize_channel_list(
+            esp_cfg.get("secret_channels", []), "espionage_secret_channels"
+        )
+        self._espionage_cfg = esp_cfg
+        self._espionage_command_set = {normalize_channel_name(c) for c in esp_cmd_raw}
+        self._espionage_secret_set = {normalize_channel_name(c) for c in esp_sec_raw}
+
         # Conversation limits
         conv = config["bot"].get("conversation", {})
         self._max_chain_depth = int(conv.get("max_chain_depth", 5))
@@ -161,6 +230,10 @@ class LoreBot(commands.Bot):
         self._chain_delay: float = float(config["bot"].get("chain_delay_seconds", 30))
         self._pending_chains: dict[tuple[int, int], list[discord.Message]] = {}
         self._pending_timers: dict[tuple[int, int], asyncio.Task] = {}
+
+        # Maps ruling Discord message IDs → routing info for player rerolls via 🎲 reaction
+        self._ruling_msg_cache: Dict[str, dict] = {}
+        self._gm_inflight: set[str] = set()
 
         # Subsystems
         m_cfg = config["models"]
@@ -181,6 +254,7 @@ class LoreBot(commands.Bot):
         self.memory = MemoryStore(config["memory"]["db_path"])
         self.state = StateStore("state.json")
         self.optouts = OptOutStore("optouts.txt")
+        self.espionage = EspionageStore("espionage.json")
         self.chat_blacklist = ChatBlacklist(
             config.get("chat_blacklist_file", "chat_blacklist.txt")
         )
@@ -193,6 +267,10 @@ class LoreBot(commands.Bot):
             palette=map_cfg.get("color_palette") or None,
         )
         self.map_store = MapStore(self.map_colors)
+        self.faction_store = FactionStore(
+            path=map_cfg.get("factions_path", "factions"),
+            palette=map_cfg.get("color_palette") or None,
+        )
         self.province_store = ProvinceStore(
             color_store=self.map_colors,
             definitions_path=map_cfg.get("province_data_path", "map_data/provinces.json"),
@@ -234,8 +312,13 @@ class LoreBot(commands.Bot):
         return True
 
     def _get_min_length(self, message: discord.Message) -> int:
-        has_image = any(a.content_type and a.content_type.startswith("image/")
-                        for a in message.attachments)
+        has_doc = any(_doc_attachment_type(a) for a in message.attachments)
+        if has_doc:
+            return 0
+        has_image = any(
+            a.content_type and a.content_type.startswith("image/")
+            for a in message.attachments
+        )
         if has_image:
             return self.cfg["bot"].get("min_image_message_length", 10)
         return self.cfg["bot"].get("min_message_length", 0)
@@ -280,6 +363,10 @@ class LoreBot(commands.Bot):
             f"`{prefix} year` — Show current in-game year",
             f"`{prefix} optout` / `{prefix} optin` — Manage your opt-out",
             f"`{prefix} whoami` — Show your role/permission status",
+            f"`{prefix} map` — Render the player ownership map",
+            f"`{prefix} mapfaction` — Render the faction membership map",
+            f"`{prefix} mapzoom <TAG>` — Render a focused country map",
+            f"`{prefix} maplist [TAG]` — List province ownership",
             f"`{prefix} help` — Show this message",
         ]
         if is_admin or is_gm:
@@ -331,6 +418,26 @@ class LoreBot(commands.Bot):
             return bool(member_role_names & self._admin_roles)
         member_role_names = {r.name.lower() for r in member.roles}
         return bool(member_role_names & self._gm_roles)
+
+    def _is_espionage_secret_channel(self, channel) -> bool:
+        name = normalize_channel_name(getattr(channel, "name", "") or "")
+        return name in self._espionage_secret_set
+
+    def _is_espionage_command_channel(self, channel) -> bool:
+        if not self._espionage_command_set:
+            return True  # no restriction configured
+        name = normalize_channel_name(getattr(channel, "name", "") or "")
+        return name in self._espionage_command_set
+
+    def _find_member_by_tag(
+        self, guild: discord.Guild, tag: str
+    ) -> Optional[discord.Member]:
+        """Return the guild member whose display name starts with the given TAG."""
+        tag_upper = tag.upper()
+        for member in guild.members:
+            if parse_tag(member.display_name) == tag_upper:
+                return member
+        return None
 
     def _is_chatuc_user(self, message: discord.Message) -> bool:
         """True if user has any chatuc_roles role. Falls back to admin_roles if not configured."""
@@ -414,6 +521,67 @@ class LoreBot(commands.Bot):
             log.info("Map: assigned %s → %s", new_tag, after.display_name)
         await self._render_and_post_map()
 
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if str(payload.emoji) != "🎲":
+            return
+        if self.user and payload.user_id == self.user.id:
+            return
+
+        msg_id = str(payload.message_id)
+        cache = self._ruling_msg_cache.get(msg_id)
+        if cache is None:
+            return
+
+        # Only the original action author may reroll
+        if payload.user_id != cache["action_author_id"]:
+            return
+
+        guild = self.get_guild(payload.guild_id)
+        if guild is None:
+            return
+
+        target_channel = guild.get_channel(cache["target_channel_id"])
+        if target_channel is None:
+            return
+        try:
+            target_msg = await target_channel.fetch_message(cache["target_msg_id"])
+        except (discord.NotFound, discord.Forbidden):
+            return
+
+        # Try to fetch original invocation message for channel/author context
+        invocation_msg: Optional[discord.Message] = None
+        inv_ch = guild.get_channel(cache["invocation_channel_id"])
+        if inv_ch:
+            try:
+                invocation_msg = await inv_ch.fetch_message(cache["invocation_msg_id"])
+            except (discord.NotFound, discord.Forbidden):
+                pass
+        if invocation_msg is None:
+            reaction_ch = guild.get_channel(payload.channel_id)
+            if reaction_ch is None:
+                return
+            try:
+                invocation_msg = await reaction_ch.fetch_message(payload.message_id)
+            except (discord.NotFound, discord.Forbidden):
+                return
+
+        output_channel = None
+        if self._gm_output_channel_name:
+            output_channel = discord.utils.find(
+                lambda c: normalize_channel_name(c.name) == self._gm_output_channel_name,
+                guild.text_channels,
+            )
+
+        await self._produce_gm_ruling(
+            invocation=invocation_msg,
+            target_msg=target_msg,
+            chain_back=[],
+            revision_request=None,
+            output_channel=output_channel,
+            focus_question=cache.get("focus_question"),
+            is_reroll=True,
+        )
+
     # ------------------------------------------------------------------
     @tasks.loop(hours=1)
     async def _rollover_task(self):
@@ -475,6 +643,12 @@ class LoreBot(commands.Bot):
         self.state.bump("messages_seen")
         content = message.content.strip()
         is_opted_out = self.optouts.is_opted_out(str(message.author.id))
+
+        # Espionage interception — fires for any post in a secret channel,
+        # independently of lore archiving and opt-out status.
+        if (self._espionage_cfg.get("enabled")
+                and self._is_espionage_secret_channel(message.channel)):
+            asyncio.ensure_future(self._check_espionage(message))
 
         # 1. Reply-to-bot path: continuation turn
         if message.reference and message.reference.message_id:
@@ -738,11 +912,16 @@ class LoreBot(commands.Bot):
     # GM mode
     # ------------------------------------------------------------------
     async def _cmd_gm(self, message: discord.Message, arg: str):
+        if not self._is_gm_user(message.author):
+            await message.reply("⚠️ You are not permitted to request GM rulings.")
+            return
+
         arg = arg.strip()
         if not arg:
             await message.reply(
-                f"Usage: `{self.prefix} gm <message-link>` — paste a Discord message "
-                f"link to the action you want adjudicated."
+                f"Usage: `{self.prefix} gm <message-link> [question]` — paste a Discord "
+                f"message link to the action you want adjudicated. Optionally add a "
+                f"specific question, e.g. `how does this affect GDP?`"
             )
             return
 
@@ -754,6 +933,7 @@ class LoreBot(commands.Bot):
             )
             return
 
+        focus_question = arg[link.end():].strip() or None
         guild_id, channel_id, msg_id = link.group(1), link.group(2), link.group(3)
         if str(message.guild.id) != guild_id:
             await message.reply("⚠️ That message is in a different server.")
@@ -796,13 +976,13 @@ class LoreBot(commands.Bot):
 
         await self._produce_gm_ruling(invocation=message, target_msg=target_msg,
                                        chain_back=[], revision_request=None,
-                                       output_channel=output_channel)
+                                       output_channel=output_channel,
+                                       focus_question=focus_question)
 
     async def _reply_gm_revision(self, message: discord.Message,
                                   chain_back: List[discord.Message],
                                   root: Optional[discord.Message]):
         """A GM has replied to a ruling asking for revision."""
-        # Pull the original target message link from the root
         if root is None:
             await message.reply("⚠️ Couldn't find the original ruling context.")
             return
@@ -817,10 +997,18 @@ class LoreBot(commands.Bot):
             await message.reply("⚠️ Couldn't re-fetch the original action message.")
             return
 
+        output_channel = None
+        if self._gm_output_channel_name:
+            output_channel = discord.utils.find(
+                lambda c: normalize_channel_name(c.name) == self._gm_output_channel_name,
+                message.guild.text_channels,
+            )
+
         await self._produce_gm_ruling(
             invocation=message, target_msg=target_msg,
             chain_back=chain_back,
             revision_request=message.content,
+            output_channel=output_channel,
         )
         self.state.bump("gm_rulings_revised")
 
@@ -828,10 +1016,21 @@ class LoreBot(commands.Bot):
                                   target_msg: discord.Message,
                                   chain_back: List[discord.Message],
                                   revision_request: Optional[str],
-                                  output_channel: Optional[discord.TextChannel] = None):
+                                  output_channel: Optional[discord.TextChannel] = None,
+                                  focus_question: Optional[str] = None,
+                                  is_reroll: bool = False):
+        gm_key = (
+            f"reroll:{invocation.id}:{target_msg.id}" if is_reroll else
+            f"revision:{invocation.id}:{target_msg.id}" if revision_request else
+            f"gm:{invocation.id}:{target_msg.id}"
+        )
+        if gm_key in self._gm_inflight:
+            log.info("Skipping duplicate GM request %s", gm_key)
+            return
+        self._gm_inflight.add(gm_key)
         dest = output_channel or invocation.channel
-        async with dest.typing():
-            try:
+        try:
+            async with dest.typing():
                 # Retrieve the author's prior posts (before the action's timestamp)
                 priors = self.memory.get_by_author_before(
                     str(target_msg.author.id),
@@ -846,16 +1045,25 @@ class LoreBot(commands.Bot):
                 # Build prior posts block
                 if priors:
                     prior_lines = []
+                    remaining_prior_chars = _GM_PRIOR_CONTEXT_CHARS
                     for p in priors:
                         meta = p["metadata"]
                         full = meta.get("full_message_text", "") or meta.get(
                             "original_excerpt", "")
+                        full = _trim_context_text(
+                            full,
+                            min(_GM_CONTEXT_ITEM_CHARS, remaining_prior_chars),
+                        )
+                        remaining_prior_chars = max(0, remaining_prior_chars - len(full))
                         prior_lines.append(
                             f"[{str(meta.get('timestamp', ''))[:10]}, "
                             f"#{meta.get('channel', '?')}, year {meta.get('year', '?')}]\n"
                             f"Summary: {p['text']}\n"
                             f"Full post: {full}"
                         )
+                        if remaining_prior_chars <= 0:
+                            prior_lines.append("[Additional prior posts omitted to keep GM context within budget.]")
+                            break
                     priors_block = "\n\n".join(prior_lines)
                 else:
                     priors_block = ("(No prior posts archived for this author. "
@@ -865,17 +1073,20 @@ class LoreBot(commands.Bot):
                 chain_msgs = await self._gather_action_chain(target_msg)
                 if len(chain_msgs) > 1:
                     action_text = "\n\n".join(
-                        m.content for m in chain_msgs if (m.content or "").strip()
+                        await self._message_text_with_documents(m)
+                        for m in chain_msgs
+                        if (m.content or "").strip() or any(_doc_attachment_type(a) for a in m.attachments)
                     )
                 else:
-                    action_text = (target_msg.content or "")
+                    action_text = await self._message_text_with_documents(target_msg)
 
                 # Build wider context: top-K semantic search on the action text
                 wider_block = ""
                 if action_text:
                     try:
-                        print(f"{_C_SEND}[GM EMB   →] action text {len(action_text)} chars{_C_RST}", flush=True)
-                        embed, embed_usage = await self.llm.embed(action_text)
+                        search_text = _trim_context_text(action_text, _EMBED_INPUT_CHARS)
+                        print(f"{_C_SEND}[GM EMB   →] action text {len(search_text)} chars{_C_RST}", flush=True)
+                        embed, embed_usage = await self.llm.embed(search_text)
                         self.state.add_usage("embedding", embed_usage)
                         print(f"{_C_RECV}[GM EMB   ←] dims={len(embed)}  hits=5 (wider context){_C_RST}", flush=True)
                         wider_hits = self.memory.search(embed, top_k=5)
@@ -886,14 +1097,26 @@ class LoreBot(commands.Bot):
                         ]
                         if wider_hits:
                             wider_lines = []
+                            remaining_wider_chars = _GM_WIDER_CONTEXT_CHARS
                             for h in wider_hits:
                                 meta = h["metadata"]
+                                full = meta.get("full_message_text", "") or meta.get(
+                                    "original_excerpt", "")
+                                full = _trim_context_text(
+                                    full,
+                                    min(_GM_CONTEXT_ITEM_CHARS, remaining_wider_chars),
+                                )
+                                remaining_wider_chars = max(0, remaining_wider_chars - len(full))
                                 wider_lines.append(
                                     f"[{str(meta.get('timestamp', ''))[:10]}, "
                                     f"by {meta.get('author_name', '?')}, "
                                     f"#{meta.get('channel', '?')}]\n"
-                                    f"Summary: {h['text']}"
+                                    f"Summary: {h['text']}\n"
+                                    f"Full post/document excerpt: {full}"
                                 )
+                                if remaining_wider_chars <= 0:
+                                    wider_lines.append("[Additional wider-context hits omitted to keep GM context within budget.]")
+                                    break
                             wider_block = "\n\n".join(wider_lines)
                     except Exception:
                         log.exception("Wider context embedding failed; continuing without")
@@ -928,6 +1151,14 @@ class LoreBot(commands.Bot):
                         f"",
                         f"=== WIDER ARCHIVE CONTEXT ===",
                         wider_block,
+                    ]
+                if focus_question:
+                    user_content_parts += [
+                        f"",
+                        f"=== SPECIFIC QUESTION FROM GM ===",
+                        focus_question,
+                        f"",
+                        f"Address this question directly in your ruling.",
                     ]
                 if revision_request:
                     user_content_parts += [
@@ -972,15 +1203,134 @@ class LoreBot(commands.Bot):
                     msgs, **_gms
                 )
                 self.state.add_usage("gm", usage)
-                if not revision_request:
+                is_replacement = bool(revision_request) or is_reroll
+                if not is_replacement:
                     self.state.bump("gm_rulings_made")
 
-                # Cache the ruling back into the archive
+                # --- Revision/reroll: void old ruling memories and locate old Discord messages ---
+                old_ruling_msg_ids: List[str] = []
+                old_ruling_channel: Optional[discord.TextChannel] = None
+                if is_replacement:
+                    old_rulings = self.memory.get_rulings_by_target_message(
+                        str(target_msg.id)
+                    )
+                    for old in old_rulings:
+                        meta = old["metadata"]
+                        if (not old_ruling_channel
+                                and meta.get("ruling_discord_channel_id")):
+                            try:
+                                ch = invocation.guild.get_channel(
+                                    int(meta["ruling_discord_channel_id"])
+                                )
+                                if ch:
+                                    old_ruling_channel = ch
+                                    old_ruling_msg_ids = [
+                                        mid.strip()
+                                        for mid in meta.get(
+                                            "ruling_discord_message_ids", ""
+                                        ).split(",")
+                                        if mid.strip()
+                                    ]
+                            except (ValueError, AttributeError):
+                                pass
+                        self.memory.void(
+                            memory_ids=[old["id"]],
+                            void_reason="superseded by reroll" if is_reroll else "superseded by revision",
+                            voided_by=str(invocation.author.id),
+                        )
+                    # Delete old Discord messages
+                    if old_ruling_channel and old_ruling_msg_ids:
+                        for mid in old_ruling_msg_ids:
+                            try:
+                                old_msg = await old_ruling_channel.fetch_message(int(mid))
+                                await old_msg.delete()
+                            except (discord.NotFound, discord.Forbidden, ValueError):
+                                pass
+
+                # effective_channel: where the ruling should appear
+                # Falls back to old_ruling_channel (from metadata) if output_channel
+                # wasn't passed explicitly (e.g. revision invoked without config channel)
+                effective_channel: discord.TextChannel = (
+                    output_channel or old_ruling_channel or invocation.channel
+                )
+                in_dedicated = effective_channel.id != invocation.channel.id
+
+                # --- Send ruling and capture Discord message IDs for future revisions ---
+                ruling_label = (
+                    " (Revised)" if revision_request else
+                    " (Rerolled)" if is_reroll else ""
+                )
+                sent_msg_ids: List[str] = []
+                body_msg_ids: List[str] = []  # ruling text messages (excludes header)
+                if in_dedicated:
+                    header = (
+                        f"**GM Ruling{ruling_label}**"
+                        f" — {target_msg.jump_url}\n"
+                        f"Action by **{target_msg.author.display_name}** · "
+                        f"Adjudicated by {invocation.author.mention}"
+                    )
+                    m = await effective_channel.send(header)
+                    sent_msg_ids.append(str(m.id))
+                    for i in range(0, len(ruling), 1900):
+                        m = await effective_channel.send(ruling[i:i + 1900])
+                        sent_msg_ids.append(str(m.id))
+                        body_msg_ids.append(str(m.id))
+                    if not is_reroll:
+                        label = "revised" if revision_request else "posted"
+                        await invocation.reply(
+                            f"✅ Ruling {label} in {effective_channel.mention}."
+                        )
+                elif is_replacement:
+                    # Inline revision/reroll: send standalone so it replaces the original
+                    for i in range(0, len(ruling), 1900):
+                        m = await effective_channel.send(ruling[i:i + 1900])
+                        sent_msg_ids.append(str(m.id))
+                        body_msg_ids.append(str(m.id))
+                    if revision_request:
+                        await invocation.reply("✅ Ruling revised.")
+                else:
+                    # First-time inline: reply to invocation
+                    for i in range(0, len(ruling), 1900):
+                        if i == 0:
+                            m = await invocation.reply(ruling[i:i + 1900])
+                        else:
+                            m = await invocation.channel.send(ruling[i:i + 1900])
+                        sent_msg_ids.append(str(m.id))
+                        body_msg_ids.append(str(m.id))
+
+                # Add 🎲 reaction to first body message so the action author can reroll
+                if body_msg_ids:
+                    try:
+                        first_body = await effective_channel.fetch_message(
+                            int(body_msg_ids[0])
+                        )
+                        await first_body.add_reaction("🎲")
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        pass
+
+                # Populate in-memory cache so on_raw_reaction_add can handle rerolls
+                cache_entry = {
+                    "target_channel_id": target_msg.channel.id,
+                    "target_msg_id": target_msg.id,
+                    "action_author_id": target_msg.author.id,
+                    "invocation_channel_id": invocation.channel.id,
+                    "invocation_msg_id": invocation.id,
+                    "focus_question": focus_question,
+                }
+                for mid in body_msg_ids:
+                    self._ruling_msg_cache[mid] = cache_entry
+
+                # --- Cache the ruling in the archive ---
                 try:
                     print(f"{_C_SEND}[GM STORE →] embedding ruling ({len(ruling)} chars){_C_RST}", flush=True)
                     ruling_embed, ruling_embed_usage = await self.llm.embed(ruling)
                     self.state.add_usage("embedding", ruling_embed_usage)
                     print(f"{_C_RECV}[GM STORE ←] dims={len(ruling_embed)}{_C_RST}", flush=True)
+                    entry_type = (
+                        "ruling_revision" if revision_request else
+                        "ruling_reroll" if is_reroll else
+                        "ruling"
+                    )
                     self.memory.add(
                         text=ruling,
                         embedding=ruling_embed,
@@ -993,7 +1343,7 @@ class LoreBot(commands.Bot):
                             "channel_id": str(invocation.channel.id),
                             "timestamp": invocation.created_at.isoformat(),
                             "year": int(self.state.current_year),
-                            "entry_type": "ruling" if not revision_request else "ruling_revision",
+                            "entry_type": entry_type,
                             "ruled_on_message_id": str(target_msg.id),
                             "ruled_on_author_id": str(target_msg.author.id),
                             "ruled_on_author_name": target_msg.author.display_name,
@@ -1001,31 +1351,137 @@ class LoreBot(commands.Bot):
                             "has_image": False,
                             "full_message_text": ruling,
                             "original_excerpt": ruling[:500],
+                            "ruling_discord_message_ids": ",".join(sent_msg_ids),
+                            "ruling_discord_channel_id": str(effective_channel.id),
                         },
                     )
                 except Exception:
                     log.exception("Failed to cache GM ruling in archive")
 
-                if output_channel is not None:
-                    header = (
-                        f"**GM Ruling** — {target_msg.jump_url}\n"
-                        f"Action by **{target_msg.author.display_name}** · "
-                        f"Adjudicated by {invocation.author.mention}"
-                    )
-                    await output_channel.send(header)
-                    for i in range(0, len(ruling), 1900):
-                        await output_channel.send(ruling[i:i + 1900])
-                    await invocation.reply(f"✅ Ruling posted in {output_channel.mention}.")
-                else:
-                    await self._send_chunked_reply(invocation, ruling)
-
-            except Exception as e:
-                log.exception("GM ruling failed")
-                await invocation.reply(f"⚠️ GM ruling failed: `{e}`")
+        except Exception as e:
+            log.exception("GM ruling failed")
+            await invocation.reply(f"⚠️ GM ruling failed: `{e}`")
+        finally:
+            self._gm_inflight.discard(gm_key)
 
     # ------------------------------------------------------------------
     # Memory ingestion
     # ------------------------------------------------------------------
+    async def _extract_doc_text(self, attachment: discord.Attachment) -> str:
+        """Download and extract plain text from a PDF or DOCX attachment."""
+        doc_type = _doc_attachment_type(attachment)
+        if not doc_type:
+            return ""
+        data = await attachment.read()
+        try:
+            if doc_type == "pdf":
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(data))
+                return "\n".join(page.extract_text() or "" for page in reader.pages)
+            else:
+                import docx as _docx
+                doc = _docx.Document(io.BytesIO(data))
+                blocks: list[str] = []
+                blocks.extend(p.text for p in doc.paragraphs if p.text.strip())
+                for table in doc.tables:
+                    for row in table.rows:
+                        cells = [
+                            _collapse_blank_lines(cell.text)
+                            for cell in row.cells
+                            if cell.text.strip()
+                        ]
+                        if cells:
+                            blocks.append(" | ".join(cells))
+                return _collapse_blank_lines("\n".join(blocks))
+        except Exception:
+            log.exception("Failed to extract text from %s (%s)", attachment.filename, doc_type)
+            return ""
+
+    async def _extract_document_parts(
+        self, attachments: list[discord.Attachment]
+    ) -> list[tuple[str, str]]:
+        parts: list[tuple[str, str]] = []
+        for a in attachments:
+            print(f"{_C_SEND}[DOC     →] extracting {a.filename!r}{_C_RST}", flush=True)
+            text = await self._extract_doc_text(a)
+            if text.strip():
+                clean = _collapse_blank_lines(text)
+                parts.append((a.filename or "document", clean))
+                print(f"{_C_RECV}[DOC     ←] {len(clean)} chars from {a.filename!r}{_C_RST}", flush=True)
+            else:
+                print(f"{_C_ERR}[DOC     ✗] no text extracted from {a.filename!r}{_C_RST}", flush=True)
+        return parts
+
+    def _format_document_context(self, parts: list[tuple[str, str]]) -> str:
+        if not parts:
+            return ""
+        return "\n\n[Attached Document Text]:\n" + "\n\n".join(
+            f"[{filename}]:\n{text}" for filename, text in parts
+        )
+
+    async def _message_text_with_documents(self, message: discord.Message) -> str:
+        text = (message.content or "").strip()
+        doc_attachments = [a for a in message.attachments if _doc_attachment_type(a)]
+        if not doc_attachments:
+            return text
+        doc_parts = await self._extract_document_parts(doc_attachments)
+        doc_context = self._format_document_context(doc_parts)
+        return f"{text}{doc_context}".strip()
+
+    async def _store_document_chunks(
+        self,
+        *,
+        doc_parts: list[tuple[str, str]],
+        source_message_id: str,
+        group_message_ids: str,
+        author_id: str,
+        author_name: str,
+        author_discord_name: str,
+        channel_name: str,
+        channel_id: str,
+        timestamp: str,
+        year: int,
+    ) -> int:
+        stored = 0
+        for filename, doc_text in doc_parts:
+            chunks = list(_iter_text_chunks(doc_text))
+            total = len(chunks)
+            for idx, chunk in enumerate(chunks, start=1):
+                chunk_text = (
+                    f"Document chunk {idx}/{total} from {filename}.\n"
+                    f"Author: {author_name}\n"
+                    f"Channel: #{channel_name}\n"
+                    f"In-game year: {year}\n\n"
+                    f"{chunk}"
+                )
+                print(f"{_C_SEND}[DOC EMB →] {filename!r} chunk {idx}/{total} ({len(chunk)} chars){_C_RST}", flush=True)
+                embedding, embed_usage = await self.llm.embed(chunk_text)
+                self.state.add_usage("embedding", embed_usage)
+                self.memory.add(
+                    text=chunk_text,
+                    embedding=embedding,
+                    metadata={
+                        "source_message_id": source_message_id,
+                        "group_message_ids": group_message_ids,
+                        "author_id": author_id,
+                        "author_name": author_name,
+                        "author_discord_name": author_discord_name,
+                        "channel": channel_name,
+                        "channel_id": channel_id,
+                        "timestamp": timestamp,
+                        "year": int(year),
+                        "entry_type": "document_chunk",
+                        "document_filename": filename,
+                        "document_chunk_index": idx,
+                        "document_chunk_total": total,
+                        "has_image": False,
+                        "full_message_text": chunk,
+                        "original_excerpt": chunk[:500],
+                    },
+                )
+                stored += 1
+        return stored
+
     async def _ingest_message(self, message: discord.Message, year_override: int | None = None) -> bool:
         log.info("Ingesting #%s msg %s (%d chars)",
                  message.channel.name, message.id, len(message.content))
@@ -1056,6 +1512,14 @@ class LoreBot(commands.Bot):
         else:
             print(f"{_C_DIM}[VISION]    no images attached{_C_RST}", flush=True)
 
+        # 2. Handle PDF / DOCX attachments
+        doc_context = ""
+        doc_attachments = [a for a in message.attachments if _doc_attachment_type(a)]
+        doc_parts: list[tuple[str, str]] = []
+        if doc_attachments:
+            doc_parts = await self._extract_document_parts(doc_attachments)
+            doc_context = self._format_document_context(doc_parts)
+
         char_name = message.author.display_name
         acct_name = message.author.name
         author_line = (
@@ -1068,16 +1532,17 @@ class LoreBot(commands.Bot):
             f"{author_line}\n"
             f"Channel: #{message.channel.name}\n"
             f"In-game year: {ingest_year}\n"
-            f"---\n{message.content}{image_context}"
+            f"---\n{message.content}{image_context}{doc_context}"
         )
+        archivist_input = _trim_context_text(prompt_input, _ARCHIVIST_INPUT_CHARS)
         _arch = self._mode_settings("archivist")
         print(f"{_C_SEND}[ARCHIVST→] model={_arch['model'] or 'default'}  temp={_arch['temperature']}"
-              f"  thinking={_fmt_think(_arch['thinking_budget'])}  input={len(prompt_input)} chars{_C_RST}", flush=True)
-        print(f"{_C_DIM}            {prompt_input[:500].replace(chr(10), '↵')}{_C_RST}", flush=True)
+              f"  thinking={_fmt_think(_arch['thinking_budget'])}  input={len(archivist_input)} chars{_C_RST}", flush=True)
+        print(f"{_C_DIM}            {archivist_input[:500].replace(chr(10), '↵')}{_C_RST}", flush=True)
 
         self.state.bump("messages_sent_to_archivist")
         summary, chat_usage = await self.llm.chat(
-            self.prompts.get("memory_extraction"), prompt_input,
+            self.prompts.get("memory_extraction"), archivist_input,
             **self._mode_settings("archivist"),
         )
         self.state.add_usage("archivist", chat_usage)
@@ -1103,7 +1568,7 @@ class LoreBot(commands.Bot):
         print(f"{_C_RECV}[EMBED    ←] dims={len(embedding)}  tokens={embed_usage['total_tokens']}{_C_RST}", flush=True)
 
         store_full = self.cfg["memory"].get("store_full_message", True)
-        full_text = message.content if store_full else ""
+        full_text = f"{message.content}{image_context}{doc_context}" if store_full else ""
 
         self.memory.add(
             text=summary,
@@ -1123,6 +1588,21 @@ class LoreBot(commands.Bot):
                 "original_excerpt": message.content[:500],
             },
         )
+        if doc_parts:
+            doc_chunks = await self._store_document_chunks(
+                doc_parts=doc_parts,
+                source_message_id=str(message.id),
+                group_message_ids=str(message.id),
+                author_id=str(message.author.id),
+                author_name=message.author.display_name,
+                author_discord_name=message.author.name,
+                channel_name=message.channel.name,
+                channel_id=str(message.channel.id),
+                timestamp=message.created_at.isoformat(),
+                year=int(ingest_year),
+            )
+            if doc_chunks:
+                print(f"{_C_OK}[DOC STORE✓] {doc_chunks} document chunks saved{_C_RST}", flush=True)
         self.state.bump("messages_archived")
         self.flog.log_archived(
             str(message.id), message.author.display_name,
@@ -1175,6 +1655,10 @@ class LoreBot(commands.Bot):
             a for m in messages for a in m.attachments
             if a.content_type and a.content_type.startswith("image/")
         ]
+        all_docs = [
+            a for m in messages for a in m.attachments
+            if _doc_attachment_type(a)
+        ]
         group_ids = [str(m.id) for m in messages]
 
         log.info("Ingesting chain of %d msgs from %s in #%s (%d chars)",
@@ -1201,6 +1685,13 @@ class LoreBot(commands.Bot):
         else:
             print(f"{_C_DIM}[VISION]    no images attached{_C_RST}", flush=True)
 
+        # 2. Handle PDF / DOCX attachments across the chain
+        doc_context = ""
+        doc_parts: list[tuple[str, str]] = []
+        if all_docs:
+            doc_parts = await self._extract_document_parts(all_docs)
+            doc_context = self._format_document_context(doc_parts)
+
         char_name = primary.author.display_name
         acct_name = primary.author.name
         author_line = (
@@ -1212,15 +1703,16 @@ class LoreBot(commands.Bot):
             f"{author_line}\n"
             f"Channel: #{primary.channel.name}\n"
             f"In-game year: {ingest_year}\n"
-            f"---\n{combined_content}{image_context}"
+            f"---\n{combined_content}{image_context}{doc_context}"
         )
+        archivist_input = _trim_context_text(prompt_input, _ARCHIVIST_INPUT_CHARS)
         _arch = self._mode_settings("archivist")
         print(f"{_C_SEND}[ARCHIVST→] model={_arch['model'] or 'default'}  temp={_arch['temperature']}"
-              f"  thinking={_fmt_think(_arch['thinking_budget'])}  input={len(prompt_input)} chars{_C_RST}", flush=True)
+              f"  thinking={_fmt_think(_arch['thinking_budget'])}  input={len(archivist_input)} chars{_C_RST}", flush=True)
 
         self.state.bump("messages_sent_to_archivist")
         summary, chat_usage = await self.llm.chat(
-            self.prompts.get("memory_extraction"), prompt_input,
+            self.prompts.get("memory_extraction"), archivist_input,
             **self._mode_settings("archivist"),
         )
         self.state.add_usage("archivist", chat_usage)
@@ -1246,6 +1738,7 @@ class LoreBot(commands.Bot):
         print(f"{_C_RECV}[EMBED    ←] dims={len(embedding)}  tokens={embed_usage['total_tokens']}{_C_RST}", flush=True)
 
         store_full = self.cfg["memory"].get("store_full_message", True)
+        full_text = f"{combined_content}{image_context}{doc_context}" if store_full else ""
         self.memory.add(
             text=summary,
             embedding=embedding,
@@ -1261,10 +1754,25 @@ class LoreBot(commands.Bot):
                 "year": int(ingest_year),
                 "entry_type": "message_chain",
                 "has_image": bool(all_images),
-                "full_message_text": combined_content if store_full else "",
+                "full_message_text": full_text,
                 "original_excerpt": combined_content[:500],
             },
         )
+        if doc_parts:
+            doc_chunks = await self._store_document_chunks(
+                doc_parts=doc_parts,
+                source_message_id=group_ids[0],
+                group_message_ids=",".join(group_ids),
+                author_id=str(primary.author.id),
+                author_name=primary.author.display_name,
+                author_discord_name=primary.author.name,
+                channel_name=primary.channel.name,
+                channel_id=str(primary.channel.id),
+                timestamp=primary.created_at.isoformat(),
+                year=int(ingest_year),
+            )
+            if doc_chunks:
+                print(f"{_C_OK}[DOC STORE✓] {doc_chunks} document chunks saved{_C_RST}", flush=True)
         self.state.bump("messages_archived")
         self.flog.log_archived(
             group_ids[0], primary.author.display_name,
@@ -1384,6 +1892,198 @@ class LoreBot(commands.Bot):
             f"```"
         )
         await message.reply(body)
+
+    # ------------------------------------------------------------------
+    # Espionage system
+    # ------------------------------------------------------------------
+
+    async def _check_espionage(self, message: discord.Message) -> None:
+        """Roll for interception by each spy watching the poster's TAG."""
+        tag = parse_tag(message.author.display_name)
+        if not tag:
+            return
+        spies = self.espionage.get_spies_for_tag(tag)
+        if not spies:
+            return
+
+        base = float(self._espionage_cfg.get("base_chance", 30))
+        modifiers: dict = self._espionage_cfg.get("base_modifiers") or {}
+        tag_mod = float(modifiers.get(tag, 0))
+        cspy_mult = float(self._espionage_cfg.get("counterspy_multiplier", 0.25))
+        is_cspy = self.espionage.is_counterspy(str(message.author.id))
+
+        effective = (base + tag_mod) * (cspy_mult if is_cspy else 1.0)
+        effective = max(0.0, min(100.0, effective))
+
+        content = (message.content or "").strip()
+        attachments = message.attachments
+
+        for spy_uid in spies:
+            if random.uniform(0, 100) > effective:
+                continue
+            try:
+                spy_member = message.guild.get_member(int(spy_uid))
+                if spy_member is None:
+                    continue
+                dm = await spy_member.create_dm()
+                body_lines = [
+                    f"🕵️ **Intelligence Intercept** — Year {self.state.current_year}",
+                    f"Your operatives have intercepted a communication from **{tag}**"
+                    f" ({message.author.display_name}) in **#{message.channel.name}**:",
+                    "",
+                ]
+                if content:
+                    body_lines.append(f">>> {content}")
+                if attachments:
+                    urls = "  ".join(a.url for a in attachments)
+                    body_lines.append(
+                        f"\n⚠️ This message included {len(attachments)} attachment(s): {urls}"
+                    )
+                await dm.send("\n".join(body_lines))
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    async def _cmd_spy(self, message: discord.Message, arg: str) -> None:
+        if not self._is_espionage_command_channel(message.channel):
+            await message.reply(
+                f"⚠️ Intelligence commands must be used in the designated channel."
+            )
+            return
+
+        tag = arg.strip().upper()
+        if not tag:
+            await message.reply(
+                f"Usage: `{self.prefix} spy <TAG>` — begin monitoring a nation's secret communications."
+            )
+            return
+
+        target = self._find_member_by_tag(message.guild, tag)
+        if target is None:
+            await message.reply(f"⚠️ No player found with tag `{tag}`.")
+            return
+        if target.id == message.author.id:
+            await message.reply("⚠️ You cannot run intelligence operations against yourself.")
+            return
+
+        user_id = str(message.author.id)
+        entry = self.espionage.get_entry(user_id)
+        max_slots = 1 if entry["counterspy"] else 3
+
+        result = self.espionage.add_target(user_id, tag, max_slots)
+        if result == "duplicate":
+            await message.reply(
+                f"Your intelligence services are already monitoring **{tag}**."
+            )
+        elif result == "full":
+            limit_str = "1 (counterspy active)" if entry["counterspy"] else "3"
+            await message.reply(
+                f"⚠️ Intelligence capacity reached ({limit_str} targets). "
+                f"Use `{self.prefix} unspy <TAG>` to stand down an operation first."
+            )
+        else:
+            current = self.espionage.list_targets(user_id)
+            await message.reply(
+                f"🕵️ Intelligence operations against **{tag}** are now active. "
+                f"({len(current)}/{max_slots} slots used)"
+            )
+
+    async def _cmd_counterspy(self, message: discord.Message) -> None:
+        if not self._is_espionage_command_channel(message.channel):
+            await message.reply(
+                f"⚠️ Intelligence commands must be used in the designated channel."
+            )
+            return
+
+        user_id = str(message.author.id)
+        entry = self.espionage.get_entry(user_id)
+
+        if entry["counterspy"]:
+            # Toggle off
+            self.espionage.set_counterspy(user_id, False)
+            await message.reply(
+                "🔓 Counterintelligence protocols **deactivated**. "
+                "Your communications are no longer encrypted. "
+                "You may now run operations against up to **3** targets."
+            )
+        else:
+            # Toggle on — trim spy slots to 1
+            dropped = self.espionage.trim_targets(user_id, 1)
+            self.espionage.set_counterspy(user_id, True)
+            lines = [
+                "🔐 Counterintelligence protocols **activated**. "
+                "Your communications are now heavily encrypted. "
+                "You are limited to **1** intelligence target."
+            ]
+            if dropped:
+                lines.append(
+                    f"⚠️ Operations against **{', '.join(dropped)}** have been stood down "
+                    f"to free resources for counterintelligence."
+                )
+            await message.reply("\n".join(lines))
+
+    async def _cmd_unspy(self, message: discord.Message, arg: str) -> None:
+        if not self._is_espionage_command_channel(message.channel):
+            await message.reply(
+                f"⚠️ Intelligence commands must be used in the designated channel."
+            )
+            return
+
+        tag = arg.strip().upper()
+        if not tag:
+            await message.reply(
+                f"Usage: `{self.prefix} unspy <TAG>` — stand down operations against a target."
+            )
+            return
+
+        user_id = str(message.author.id)
+        if self.espionage.remove_target(user_id, tag):
+            await message.reply(
+                f"🔍 Intelligence operations against **{tag}** have been stood down."
+            )
+        else:
+            await message.reply(
+                f"⚠️ You are not currently running operations against `{tag}`."
+            )
+
+    async def _cmd_spylist(self, message: discord.Message) -> None:
+        if not self._is_espionage_command_channel(message.channel):
+            await message.reply(
+                f"⚠️ Intelligence commands must be used in the designated channel."
+            )
+            return
+
+        user_id = str(message.author.id)
+        entry = self.espionage.get_entry(user_id)
+        targets = entry["targets"]
+        cspy = entry["counterspy"]
+        max_slots = 1 if cspy else 3
+
+        if not targets and not cspy:
+            await message.reply("You have no active intelligence operations.")
+            return
+
+        lines = [f"**Intelligence Operations** ({len(targets)}/{max_slots} targets active)"]
+        for t in targets:
+            lines.append(f"• **{t}** — monitoring")
+        if cspy:
+            lines.append("\n🔐 Counterintelligence: **ACTIVE** (communications encrypted)")
+        else:
+            lines.append("\n🔓 Counterintelligence: inactive")
+
+        # Base interception chance as a rough guide
+        base = float(self._espionage_cfg.get("base_chance", 30))
+        cspy_mult = float(self._espionage_cfg.get("counterspy_multiplier", 0.25))
+        own_tag = parse_tag(message.author.display_name) or "?"
+        if cspy:
+            lines.append(
+                f"📊 Others spying on **{own_tag}**: ~{base * cspy_mult:.0f}% intercept chance (reduced)"
+            )
+        else:
+            lines.append(
+                f"📊 Others spying on **{own_tag}**: ~{base:.0f}% base intercept chance"
+            )
+
+        await message.reply("\n".join(lines))
 
     # ------------------------------------------------------------------
     # Admin: ingest backfill
@@ -2007,12 +2707,8 @@ class LoreBot(commands.Bot):
         return None
 
     def _province_render_args(self) -> dict:
-        """Build keyword args for map_renderer calls that include province state."""
-        return dict(
-            province_ownership=self.province_store.get_ownership(),
-            province_definitions=self.province_store.all_definitions(),
-            subdivided_tags=self.province_store.subdivided_tags(),
-        )
+        """Build keyword args for map_renderer calls that include province ownership."""
+        return dict(province_ownership=self.province_store.get_ownership())
 
     async def _render_and_post_map(
         self, channel: Optional[discord.TextChannel] = None
@@ -2075,79 +2771,69 @@ class LoreBot(commands.Bot):
             file=discord.File(fp=io.BytesIO(img_bytes), filename=f"dnc_map_{tag}.png")
         )
 
-    # ── Province command handlers ─────────────────────────────────────────────
-
-    def _geojson_features_for_tag(self, tag: str) -> list[dict]:
-        """Fetch the GeoJSON features for a country tag from the cached world GDF."""
-        name = map_renderer.TAG_TO_NAME.get(tag, "").strip()
-        if not name:
-            return []
-        world = map_renderer._world()
-        subset = world[world["NAME"] == name]
-        if subset.empty:
-            return []
-        # Convert each row to a GeoJSON-compatible feature dict
-        features = []
-        for _, row in subset.iterrows():
-            geom = row.geometry
-            features.append({"geometry": geom.__geo_interface__})
-        return features
-
-    async def _cmd_mapdivide(self, message: discord.Message, arg: str) -> None:
-        """!DNC mapdivide TAG N — subdivide country TAG into N auto-numbered provinces."""
-        parts = arg.strip().upper().split()
-        if len(parts) != 2 or not parts[0].isalpha() or not parts[1].isdigit():
+    async def _cmd_mapfaction(self, message: discord.Message) -> None:
+        """!DNC mapfaction — render world map colored by faction membership."""
+        self.faction_store.reload()
+        memberships = self.faction_store.get_memberships()
+        if not memberships:
             await message.reply(
-                f"Usage: `{self.prefix} mapdivide TAG N`\n"
-                "Example: `!DNC mapdivide USSR 15`"
-            )
-            return
-        tag, n = parts[0], int(parts[1])
-        if n < 2 or n > 500:
-            await message.reply("Province count must be between 2 and 500.")
-            return
-
-        features = self._geojson_features_for_tag(tag)
-        if not features:
-            await message.reply(
-                f"Tag `{tag}` not found in the 1970 map. "
-                "Check `TAG_TO_NAME` in map_renderer.py."
+                f"No faction memberships are configured. Edit `{self.faction_store.path}` "
+                "and add sections like `[NATO]` with `members = USA, GBR, FRA`."
             )
             return
 
         async with message.channel.typing():
             try:
-                provinces = self.province_store.subdivide(tag, n, features)
+                img_bytes = await map_renderer.render_faction_map(memberships)
             except Exception as e:
-                await message.reply(f"Subdivision failed: {e}")
-                return
-            occupation = self.map_store.get_occupation()
-            try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
-            except Exception as e:
-                await message.reply(
-                    f"Subdivided `{tag}` into {len(provinces)} provinces, "
-                    f"but map render failed: {e}"
-                )
+                await message.reply(f"Faction map render failed: {e}")
                 return
 
-        self.flog.log_command("mapdivide", str(message.author), message.channel.name, arg)
+        warning_text = ""
+        warnings = self.faction_store.warnings
+        if warnings:
+            warning_text = "\nWarnings: " + "; ".join(warnings[:5])
+            if len(warnings) > 5:
+                warning_text += f"; +{len(warnings) - 5} more"
         await message.reply(
-            f"Subdivided `{tag}` into **{len(provinces)} provinces** "
-            f"(`{provinces[0].id}` … `{provinces[-1].id}`).",
-            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+            f"Faction map rendered from `{self.faction_store.path}`.{warning_text}",
+            file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_faction_map.png"),
         )
 
+    # ── Province command handlers ─────────────────────────────────────────────
+
+    async def _cmd_mapdivide(self, message: discord.Message, arg: str) -> None:
+        """!DNC mapdivide — provinces are now always visible from ArcGIS data."""
+        tag = arg.strip().upper().split()[0] if arg.strip() else ""
+        if tag:
+            iso2 = map_renderer.TAG_TO_ISO2.get(tag)
+            if not iso2:
+                await message.reply(f"`{tag}` has no ArcGIS province mapping. Check `TAG_TO_ISO2`.")
+                return
+            provinces = self.province_store.list_by_country(tag)
+            await message.reply(
+                f"`{tag}` has **{len(provinces)}** real ArcGIS provinces (ISO2: `{iso2}`).\n"
+                f"Province IDs look like `{provinces[0].id}` … `{provinces[-1].id}`\n"
+                "Use `!DNC maplist TAG` to see them all, or `!DNC mapset ID @player` to assign ownership."
+                if provinces else f"`{tag}` maps to ISO2 `{iso2}` but no provinces found in ArcGIS data."
+            )
+        else:
+            await message.reply(
+                "Provinces are now loaded automatically from real ArcGIS administrative divisions.\n"
+                "Use `!DNC maplist TAG` to browse provinces for a country,\n"
+                "or `!DNC mapset PROVINCE_ID @player` (e.g. `US-AK`) to assign ownership."
+            )
+
     async def _cmd_mapmerge(self, message: discord.Message, tag: str) -> None:
-        """!DNC mapmerge TAG — remove subdivision, revert to country-level ownership."""
+        """!DNC mapmerge TAG — release all province ownership for TAG."""
         tag = tag.strip().upper()
         if not re.match(r"^[A-Z]{2,4}$", tag):
             await message.reply(f"Usage: `{self.prefix} mapmerge TAG`")
             return
 
-        removed = self.province_store.merge(tag)
-        if not removed:
-            await message.reply(f"`{tag}` is not currently subdivided.")
+        released = self.province_store.release_all_for_tag(tag)
+        if released == 0:
+            await message.reply(f"`{tag}` has no owned provinces to release.")
             return
 
         async with message.channel.typing():
@@ -2155,12 +2841,12 @@ class LoreBot(commands.Bot):
             try:
                 img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
             except Exception as e:
-                await message.reply(f"Merged `{tag}` back to country level (render failed: {e}).")
+                await message.reply(f"Released {released} province(s) for `{tag}` (render failed: {e}).")
                 return
 
         self.flog.log_command("mapmerge", str(message.author), message.channel.name, tag)
         await message.reply(
-            f"Merged `{tag}` back to country-level ownership.",
+            f"Released **{released}** province(s) for `{tag}` — all now uncontrolled.",
             file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
         )
 
@@ -2170,7 +2856,7 @@ class LoreBot(commands.Bot):
         if len(parts) != 2:
             await message.reply(
                 f"Usage: `{self.prefix} mapset PROVINCE_ID @player`\n"
-                "Example: `!DNC mapset USSR-03 @Stalin`"
+                "Example: `!DNC mapset US-AK @player` (use `!DNC maplist USA` to see IDs)"
             )
             return
         province_id = parts[0].upper()
@@ -2178,7 +2864,7 @@ class LoreBot(commands.Bot):
 
         m = MENTION_RE.match(mention_part)
         if not m:
-            await message.reply("Please @mention the player: `!DNC mapset USSR-03 @player`")
+            await message.reply("Please @mention the player: `!DNC mapset US-AK @player`")
             return
         user_id = m.group(1)
 
@@ -2186,7 +2872,15 @@ class LoreBot(commands.Bot):
         display_name = member.display_name if member else f"User#{user_id}"
         player_tag = parse_tag(member.nick or member.name) if member else ""
         if not player_tag:
-            player_tag = province_id.split("-")[0]
+            # Fall back to first occupied game tag that maps to this province's ISO2
+            prov = self.province_store.get_province(province_id)
+            if prov:
+                for tag in map_renderer._ISO2_TO_TAGS.get(prov.iso_cc, []):
+                    if tag in self.map_store.get_occupation():
+                        player_tag = tag
+                        break
+            if not player_tag:
+                player_tag = province_id.split("-")[0]
 
         try:
             self.province_store.assign(province_id, player_tag, user_id, display_name)
@@ -2235,34 +2929,47 @@ class LoreBot(commands.Bot):
         )
 
     async def _cmd_maplist(self, message: discord.Message, tag: str) -> None:
-        """!DNC maplist [TAG] — list provinces and their owners."""
+        """!DNC maplist TAG — list real ArcGIS provinces for TAG and their owners."""
         tag = tag.strip().upper() if tag.strip() else ""
 
-        if tag:
-            provinces = self.province_store.list_by_country(tag)
-            if not provinces:
-                await message.reply(
-                    f"`{tag}` has no provinces defined. "
-                    f"Use `{self.prefix} mapdivide {tag} N` to subdivide it."
-                )
-                return
+        if not tag:
+            # Show countries with owned provinces
             ownership = self.province_store.get_ownership()
-            lines = [f"**Provinces of {tag}** ({len(provinces)} total):\n"]
-            for p in provinces:
-                o = ownership.get(p.id)
-                owner_str = f"**{o.display_name}** ({o.player_tag})" if o else "*uncontrolled*"
-                lines.append(f"`{p.id}` — {owner_str}")
-            await message.reply("\n".join(lines))
-        else:
-            subdivided = self.province_store.subdivided_tags()
-            if not subdivided:
-                await message.reply("No countries are currently subdivided into provinces.")
+            if not ownership:
+                await message.reply("No provinces are currently owned. Use `!DNC mapset PROVINCE_ID @player` to assign.")
                 return
-            lines = [f"**Subdivided countries** ({len(subdivided)}):\n"]
-            for t in sorted(subdivided):
-                n = len(self.province_store.list_by_country(t))
-                lines.append(f"`{t}` — {n} provinces")
+            by_iso2: dict[str, list] = {}
+            for pid, o in ownership.items():
+                iso2 = pid.split("-")[0] if "-" in pid else pid
+                by_iso2.setdefault(iso2, []).append((pid, o))
+            lines = [f"**Owned provinces** ({len(ownership)} total):\n"]
+            for iso2, items in sorted(by_iso2.items()):
+                lines.append(f"  `{iso2}`: {len(items)} province(s)")
             await message.reply("\n".join(lines))
+            return
+
+        provinces = self.province_store.list_by_country(tag)
+        if not provinces:
+            iso2 = map_renderer.TAG_TO_ISO2.get(tag)
+            if not iso2:
+                await message.reply(f"`{tag}` has no ArcGIS mapping. Check `TAG_TO_ISO2` in map_renderer.py.")
+            else:
+                await message.reply(f"`{tag}` (ISO2: `{iso2}`) has no provinces in the ArcGIS dataset.")
+            return
+
+        ownership = self.province_store.get_ownership()
+        lines = [f"**Provinces of {tag}** ({len(provinces)} total):\n"]
+        for p in provinces:
+            o = ownership.get(p.id)
+            owner_str = f"**{o.display_name}** ({o.player_tag})" if o else "*uncontrolled*"
+            lines.append(f"`{p.id}` {p.name} — {owner_str}")
+
+        # Discord message limit: split if too long
+        text = "\n".join(lines)
+        if len(text) > 1900:
+            await message.reply(text[:1900] + f"\n… (+{len(provinces) - text[:1900].count(chr(10))} more)")
+        else:
+            await message.reply(text)
 
     async def _cmd_mapparse(self, message: discord.Message, arg: str) -> None:
         """!DNC mapparse <message-link> — LLM reads a post and proposes ownership changes."""
@@ -2293,38 +3000,49 @@ class LoreBot(commands.Bot):
             await message.reply("That message has no text content.")
             return
 
-        subdivided = self.province_store.subdivided_tags()
-        if not subdivided:
-            await message.reply(
-                "No provinces are defined yet. "
-                f"Use `{self.prefix} mapdivide TAG N` to create some first."
-            )
-            return
-
         ownership = self.province_store.get_ownership()
-        defs = self.province_store.all_definitions()
-        province_context = {
-            pid: {
-                "parent_tag": p.parent_tag,
+        # Build province context limited to occupied countries (keeps LLM prompt size manageable)
+        occupation = self.map_store.get_occupation()
+        occupied_iso2 = {map_renderer.TAG_TO_ISO2[t] for t in occupation if t in map_renderer.TAG_TO_ISO2}
+        iso2_to_primary = {}
+        for t, iso2 in map_renderer.TAG_TO_ISO2.items():
+            iso2_to_primary.setdefault(iso2, t)
+
+        import arcgis_provinces as _ap
+        province_context = {}
+        for pid, p in _ap.get_all().items():
+            if p.iso_cc not in occupied_iso2 and pid not in ownership:
+                continue
+            province_context[pid] = {
+                "parent_tag": iso2_to_primary.get(p.iso_cc, p.iso_cc),
                 "name": p.name,
                 "owner": ownership[pid].display_name if pid in ownership else None,
             }
-            for pid, p in defs.items()
-        }
+
+        if not province_context:
+            await message.reply("No provinces in occupied countries found. Occupy a country first with `!DNC mapset`.")
+            return
 
         map_cfg = self.cfg.get("spatial_mapping", {})
         model = map_cfg.get("map_llm_model") or None
+        tavily_enabled = (
+            self.tavily is not None
+            and self.cfg.get("tavily", {}).get("enabled_modes", {}).get("mapparse", False)
+        )
 
         async with message.channel.typing():
             try:
                 changes = await map_llm.parse_post_for_changes(
-                    post_text, province_context, self.llm, model=model
+                    post_text, province_context, self.llm, model=model,
+                    tavily=self.tavily if tavily_enabled else None,
                 )
             except Exception as e:
                 await message.reply(f"LLM analysis failed: {e}")
                 return
 
         summary = map_llm.format_change_summary(changes, self.province_store)
+        if len(summary) > 4000:
+            summary = summary[:3950] + "\n…*(summary truncated)*"
         confirm_msg = await message.reply(summary)
 
         if not changes:
@@ -2386,6 +3104,122 @@ class LoreBot(commands.Bot):
             except Exception as e:
                 await confirm_msg.reply("\n".join(result_lines) + f"\n(Render failed: {e})")
 
+    async def _cmd_mapchange(self, message: discord.Message, arg: str) -> None:
+        """!DNC mapchange <instructions> — LLM applies direct map ownership changes."""
+        instructions = arg.strip()
+        if not instructions:
+            await message.reply(
+                f"Usage: `{self.prefix} mapchange <instructions>`\n"
+                f"Example: `{self.prefix} mapchange Assign Bavaria and Baden to FRG, release Hamburg`"
+            )
+            return
+
+        map_cfg = self.cfg.get("spatial_mapping", {})
+        ownership = self.province_store.get_ownership()
+
+        import arcgis_provinces as _ap
+        all_provinces = _ap.get_all()
+
+        # Include all provinces from game-tagged countries + any currently owned province
+        relevant_iso2 = set(map_renderer.TAG_TO_ISO2.values())
+        iso2_to_primary_tag: dict[str, str] = {}
+        for tag, iso2 in map_renderer.TAG_TO_ISO2.items():
+            iso2_to_primary_tag.setdefault(iso2, tag)
+
+        province_context: dict = {}
+        for pid, p in all_provinces.items():
+            if p.iso_cc not in relevant_iso2 and pid not in ownership:
+                continue
+            province_context[pid] = {
+                "parent_tag": iso2_to_primary_tag.get(p.iso_cc, p.iso_cc),
+                "name": p.name,
+                "owner": ownership[pid].display_name if pid in ownership else None,
+            }
+
+        if not province_context:
+            await message.reply("No province data available.")
+            return
+
+        model = map_cfg.get("map_llm_model") or None
+        tavily_enabled = (
+            self.tavily is not None
+            and self.cfg.get("tavily", {}).get("enabled_modes", {}).get("mapchange", False)
+        )
+
+        async with message.channel.typing():
+            try:
+                changes = await map_llm.process_map_instructions(
+                    instructions, province_context, self.llm, model=model,
+                    tavily=self.tavily if tavily_enabled else None,
+                )
+            except Exception as e:
+                await message.reply(f"LLM processing failed: {e}")
+                return
+
+        summary = map_llm.format_change_summary(changes, self.province_store)
+        if len(summary) > 4000:
+            summary = summary[:3950] + "\n…*(summary truncated)*"
+        confirm_msg = await message.reply(summary)
+
+        if not changes:
+            return
+
+        await confirm_msg.add_reaction("✅")
+        await confirm_msg.add_reaction("❌")
+
+        def _check(reaction, user):
+            return (
+                reaction.message.id == confirm_msg.id
+                and str(reaction.emoji) in ("✅", "❌")
+                and self._is_admin_user_by_id(user, message.guild)
+            )
+
+        try:
+            reaction, _ = await self.wait_for("reaction_add", timeout=60.0, check=_check)
+        except asyncio.TimeoutError:
+            await confirm_msg.reply("Timed out — no changes applied.")
+            return
+
+        if str(reaction.emoji) == "❌":
+            await confirm_msg.reply("Cancelled — no changes applied.")
+            return
+
+        applied, errors = 0, []
+        for ch in changes:
+            action = ch.get("action")
+            pid = ch.get("province_id", "").upper()
+            try:
+                if action == "assign_province":
+                    player_tag = ch.get("player_tag", "").upper()
+                    self.province_store.assign(pid, player_tag, "", player_tag)
+                    applied += 1
+                elif action == "release_province":
+                    self.province_store.release(pid)
+                    applied += 1
+                elif action == "transfer_province":
+                    to_tag = ch.get("to_tag", "").upper()
+                    self.province_store.assign(pid, to_tag, "", to_tag)
+                    applied += 1
+            except Exception as e:
+                errors.append(f"`{pid}`: {e}")
+
+        self.flog.log_command("mapchange", str(message.author), message.channel.name, instructions[:120])
+
+        result_lines = [f"Applied **{applied}** change(s)."]
+        if errors:
+            result_lines.append("Errors: " + "; ".join(errors))
+
+        async with message.channel.typing():
+            occupation = self.map_store.get_occupation()
+            try:
+                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                await confirm_msg.reply(
+                    "\n".join(result_lines),
+                    file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
+                )
+            except Exception as e:
+                await confirm_msg.reply("\n".join(result_lines) + f"\n(Render failed: {e})")
+
     # ------------------------------------------------------------------
     async def close(self):
         for task in list(self._pending_timers.values()):
@@ -2408,7 +3242,7 @@ class LoreCog(commands.Cog):
         self.bot = bot
 
     async def cog_check(self, ctx: commands.Context) -> bool:
-        if ctx.command.name in ("optout", "optin"):
+        if ctx.command.name in ("optout", "optin", "spy", "counterspy", "unspy", "spylist"):
             return True
         if self.bot.optouts.is_opted_out(str(ctx.author.id)):
             await ctx.reply(
@@ -2451,6 +3285,22 @@ class LoreCog(commands.Cog):
     @commands.command(name="help")
     async def help(self, ctx: commands.Context):
         await ctx.reply(self.bot._help_text(ctx.message))
+
+    @commands.command(name="spy")
+    async def spy(self, ctx: commands.Context, *, arg: str = ""):
+        await self.bot._cmd_spy(ctx.message, arg)
+
+    @commands.command(name="counterspy")
+    async def counterspy(self, ctx: commands.Context):
+        await self.bot._cmd_counterspy(ctx.message)
+
+    @commands.command(name="unspy")
+    async def unspy(self, ctx: commands.Context, *, arg: str = ""):
+        await self.bot._cmd_unspy(ctx.message, arg)
+
+    @commands.command(name="spylist")
+    async def spylist(self, ctx: commands.Context):
+        await self.bot._cmd_spylist(ctx.message)
 
     @commands.command(name="ingest")
     async def ingest(self, ctx: commands.Context, *, arg: str = ""):
@@ -2532,6 +3382,10 @@ class LoreCog(commands.Cog):
     async def mapzoom(self, ctx: commands.Context, *, tag: str = ""):
         await self.bot._cmd_mapzoom(ctx.message, tag)
 
+    @commands.command(name="mapfaction")
+    async def mapfaction(self, ctx: commands.Context):
+        await self.bot._cmd_mapfaction(ctx.message)
+
     @commands.command(name="mapdivide")
     async def mapdivide(self, ctx: commands.Context, *, arg: str = ""):
         if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
@@ -2560,6 +3414,11 @@ class LoreCog(commands.Cog):
     async def mapparse(self, ctx: commands.Context, *, arg: str = ""):
         if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
         await self.bot._cmd_mapparse(ctx.message, arg)
+
+    @commands.command(name="mapchange")
+    async def mapchange(self, ctx: commands.Context, *, arg: str = ""):
+        if not self.bot._is_admin_channel(ctx.channel) or not self.bot._is_admin_user(ctx.message): return
+        await self.bot._cmd_mapchange(ctx.message, arg)
 
 
 def main():

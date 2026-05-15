@@ -5,3 +5,5 @@ PyYAML>=6.0
 python-dotenv>=1.0.0
 geopandas>=0.14
 matplotlib>=3.8
+pypdf>=4.0
+python-docx>=1.0

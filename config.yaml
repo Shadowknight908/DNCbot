@@ -53,6 +53,7 @@ discord:
     admin:
       - "⚙bot-log⚙"
       - "staff-chat"
+      - "shhh"
 
   # --- ROLE-BASED PERMISSIONS ---
   # Names are matched case-insensitively against Discord role names.
@@ -71,6 +72,7 @@ gm:
   # Falls back to admin roles if empty.
   roles:
     - "Department of GMs"
+    - "Nations"
   # Channels where !DNC gm can be invoked. If empty, allowed from any channel.
   channels:
     - "🎲gm-requests🎲"
@@ -116,7 +118,7 @@ models:
       max_tokens:
       thinking_budget:
     query:
-      model: z-ai/glm-5.1
+      model: deepseek/deepseek-v4-flash
       temperature: 0.7
       top_p:
       top_k:
@@ -159,6 +161,8 @@ tavily:
   enabled_modes:
     chat: true
     chatuc: false
+    mapparse: true
+    mapchange: true
   max_results: 5
   search_depth: "basic"   # "basic" or "advanced"
 
@@ -175,8 +179,10 @@ spatial_mapping:
   province_data_path: "map_data/provinces.json"
   # Path where province ownership state is persisted.
   province_ownership_path: "province_ownership.json"
+  # Human-editable faction membership file used by !DNC mapfaction.
+  factions_path: "factions"
   # Model for !DNC mapparse LLM analysis. null = use models.defaults.model.
-  map_llm_model: null
+  map_llm_model: moonshotai/kimi-k2.6
   # Ordered hex palette. Colors are assigned to tags in this order as nations
   # are first occupied; released and re-assigned fresh when a tag becomes vacant.
   # Edit this list to customize nation colors.
@@ -201,6 +207,30 @@ spatial_mapping:
     - "#7209b7"
     - "#560bad"
     - "#480ca8"
+
+# --- ESPIONAGE SYSTEM ---
+espionage:
+  enabled: false
+  # Channels where !DNC spy / counterspy / unspy / spylist can be used.
+  # If empty, allowed from any channel.
+  command_channels:
+    - "intelligence"
+  # Channels whose messages are checked for interception.
+  # Typically your secret-actions channel(s).
+  secret_channels:
+    - "🤫secret-actions🤫"
+  # Base interception probability (0–100 percent).
+  base_chance: 30
+  # Multiplier on base_chance when the TARGET has counterspy active.
+  # 0.25 means only 25% of the normal chance (a 75% reduction).
+  counterspy_multiplier: 0.25
+  # Per-TAG additive modifier to base_chance.
+  # Positive = easier to intercept (e.g. large signals apparatus leaks more).
+  # Negative = harder to intercept (e.g. tight OPSEC).
+  base_modifiers: {}
+  #   USA: 15
+  #   URS: 10
+  #   GDR: -10
 
 # --- SYSTEM PROMPTS ---
 prompts:

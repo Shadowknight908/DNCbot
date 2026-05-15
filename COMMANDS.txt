@@ -44,6 +44,11 @@ MAP COMMANDS — PUBLIC
 !DNC map
     Render and post the full world map, coloured by player ownership.
 
+!DNC mapfaction
+    Render the full world map coloured by faction membership from the
+    human-editable factions file. Countries in multiple factions are
+    drawn with hatch overlays.
+
 !DNC mapzoom <TAG>
     Zoom into a specific country and render just that region.
     TAG is a 2–4 letter ISO-style country tag (e.g. USA, USSR, GBR).

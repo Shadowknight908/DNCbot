@@ -128,6 +128,44 @@ class MemoryStore:
             "embedding": result["embeddings"][0],
         }
 
+    def get_all_by_source_message(
+        self, source_message_id: str
+    ) -> List[Dict[str, Any]]:
+        result = self._collection.get(
+            where={"source_message_id": str(source_message_id)},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        if not result.get("ids"):
+            return []
+        return [
+            {
+                "id": result["ids"][i],
+                "text": result["documents"][i],
+                "metadata": result["metadatas"][i] or {},
+                "embedding": result["embeddings"][i],
+            }
+            for i in range(len(result["ids"]))
+        ]
+
+    def get_rulings_by_target_message(
+        self, ruled_on_message_id: str
+    ) -> List[Dict[str, Any]]:
+        result = self._collection.get(
+            where={"ruled_on_message_id": str(ruled_on_message_id)},
+            include=["documents", "metadatas", "embeddings"],
+        )
+        if not result.get("ids"):
+            return []
+        return [
+            {
+                "id": result["ids"][i],
+                "text": result["documents"][i],
+                "metadata": result["metadatas"][i] or {},
+                "embedding": result["embeddings"][i],
+            }
+            for i in range(len(result["ids"]))
+        ]
+
     def get_by_author(self, author_id: str) -> List[Dict[str, Any]]:
         result = self._collection.get(
             where={"author_id": str(author_id)},
@@ -217,12 +255,12 @@ class MemoryStore:
     def void_by_source_message(
         self, source_message_id: str, voided_by: str
     ) -> Optional[str]:
-        existing = self.get_by_source_message(source_message_id)
+        existing = self.get_all_by_source_message(source_message_id)
         if not existing:
             return None
         group_id = str(uuid.uuid4())
         self.void(
-            memory_ids=[existing["id"]],
+            memory_ids=[m["id"] for m in existing],
             void_reason=f"message {source_message_id}",
             voided_by=voided_by,
             void_group_id=group_id,

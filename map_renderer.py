@@ -1,17 +1,22 @@
 """Map rendering engine.
 
 Public async API (CPU-bound work runs in a thread executor):
-    render_world_map(occupation, province_ownership, province_definitions, units=[]) → PNG bytes
-    render_zoom_map(iso_tag, occupation, province_ownership, province_definitions, ...) → PNG bytes
+    render_world_map(occupation, province_ownership) → PNG bytes
+    render_zoom_map(iso_tag, occupation, province_ownership, ...) → PNG bytes
 
 Layer architecture:
     Layer 0 — base choropleth: nation fills (occupied = player color, else gray)
-    Layer 1 — province fills: province cells drawn on top for subdivided nations
-    Layer 2 — labels: province labels (subdivided nations) or country labels (whole nations)
-    Layer 3 — military units (future): NATO-style markers from `units` list
+    Layer 1 — province fills: real ArcGIS admin divisions, always visible
+    Layer 2 — nation borders: drawn over provinces for clean country outlines
+    Layer 3 — labels: province labels (zoom) or country labels (world)
+    Layer 4 — military units (future): NATO-style markers from `units` list
 
-Geometry source: ArcGIS Historic National Boundaries (Year_1970 layer),
+Nation boundary source: ArcGIS Historic National Boundaries (Year_1970),
 cached locally at map_data/world_1970.geojson.
+
+Province source: World_Administrative_Divisions.geojson (ArcGIS admin divisions).
+Province IDs are ISO_CC-ISO_SUB (e.g. "US-AK", "DE-BB").
+Game tags map to ISO2 codes via TAG_TO_ISO2.
 """
 from __future__ import annotations
 
@@ -24,23 +29,29 @@ from io import BytesIO
 from typing import Optional
 
 import warnings
-from collections import defaultdict
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 import geopandas as gpd
+import pandas as pd
 from shapely.geometry import shape
 
+import arcgis_provinces
+from faction_store import FactionMembership
 from map_store import OccupiedNation
 
 log = logging.getLogger("dnc.map_renderer")
 
 UNOCCUPIED_COLOR = "#cccccc"
-_OCEAN_COLOR = "#a8d5e2"
+_OCEAN_COLOR = "#2a2a2a"
 _BORDER_COLOR = "#ffffff"
 _PROVINCE_BORDER_COLOR = "#888888"
 _HIGHLIGHT_EDGE = "#333333"
+_FACTION_HATCHES = ("////", "\\\\\\\\", "xxxx", "....", "++++", "oooo")
+
+_EQUAL_EARTH_CRS = "+proj=eqearth +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
 
 _DATA_DIR = "map_data"
 _GEOJSON_PATH = os.path.join(_DATA_DIR, "world_1970.geojson")
@@ -55,6 +66,7 @@ _ARCGIS_URL = (
 TAG_TO_NAME: dict[str, str] = {
     # Major powers
     "USA": "United States",
+    "RUS": "Soviet Union",
     "USSR": "Soviet Union",
     "GBR": "United Kingdom",
     "FRA": "France",
@@ -263,7 +275,72 @@ _NAME_TO_TAG: dict[str, str] = {}
 for _t, _n in TAG_TO_NAME.items():
     _NAME_TO_TAG.setdefault(_n.strip(), _t)
 
+# Maps game tags → ISO 3166-1 alpha-2 codes for ArcGIS province lookups.
+# Historical states map to their closest modern equivalent.
+TAG_TO_ISO2: dict[str, str] = {
+    # Major powers
+    "USA": "US", "USSR": "RU", "GBR": "GB", "FRA": "FR", "CHN": "CN",
+    "JPN": "JP", "FRG": "DE", "DEW": "DE", "GDR": "DE", "DDR": "DE",
+    "ITA": "IT", "CAN": "CA", "AUS": "AU", "NZL": "NZ",
+    # Europe
+    "POL": "PL", "HUN": "HU", "ROM": "RO", "ROU": "RO",
+    "BUL": "BG", "BGR": "BG", "CZS": "CZ", "CSK": "CZ",
+    "YUG": "RS", "ALB": "AL", "GRC": "GR", "TUR": "TR",
+    "SWE": "SE", "NOR": "NO", "DNK": "DK", "FIN": "FI",
+    "ISL": "IS", "IRL": "IE", "NLD": "NL", "BEL": "BE",
+    "LUX": "LU", "CHE": "CH", "AUT": "AT", "ESP": "ES", "PRT": "PT",
+    "MCO": "MC", "AND": "AD", "SMR": "SM", "VAT": "VA", "MLT": "MT",
+    "CYP": "CY",
+    # Middle East / North Africa
+    "ISR": "IL", "JOR": "JO", "SYR": "SY", "LBN": "LB",
+    "IRQ": "IQ", "IRN": "IR", "SAU": "SA", "KWT": "KW",
+    "BHR": "BH", "QAT": "QA", "TRS": "AE", "UAE": "AE",
+    "YAR": "YE", "NYE": "YE", "SYE": "YE", "PDY": "YE",
+    "EGY": "EG", "UAR": "EG", "LBA": "LY", "TUN": "TN",
+    "ALG": "DZ", "DZA": "DZ", "MAR": "MA", "OMA": "OM", "OMN": "OM",
+    # Asia
+    "IND": "IN", "PAK": "PK", "BGD": "BD", "LKA": "LK", "CEY": "LK",
+    "NEP": "NP", "BTN": "BT", "MDV": "MV", "MMR": "MM", "BUR": "MM",
+    "THA": "TH", "KHM": "KH", "LAO": "LA",
+    "VNS": "VN", "RVN": "VN", "SVN": "VN", "VND": "VN", "DRV": "VN", "NVN": "VN",
+    "MYS": "MY", "SGP": "SG", "IDN": "ID", "PHL": "PH",
+    "TWN": "TW", "PRK": "KP", "KPN": "KP", "NKO": "KP",
+    "KOR": "KR", "SKO": "KR", "MNG": "MN", "MPR": "MN",
+    "AFG": "AF", "HKG": "HK",
+    # Africa
+    "ETH": "ET", "ERI": "ER", "SOM": "SO", "KEN": "KE",
+    "TZA": "TZ", "UGA": "UG", "RWA": "RW", "BDI": "BI",
+    "MOZ": "MZ", "ZMB": "ZM", "RHO": "ZW", "ZWE": "ZW",
+    "SWZ": "SZ", "LSO": "LS", "BWA": "BW", "ZAF": "ZA",
+    "SWA": "NA", "NAM": "NA", "AGO": "AO",
+    "COD": "CD", "ZAR": "CD", "COG": "CG", "GAB": "GA",
+    "CAF": "CF", "CMR": "CM", "NGA": "NG", "GHA": "GH",
+    "CIV": "CI", "LBR": "LR", "SLE": "SL", "GIN": "GN",
+    "GNB": "GW", "SEN": "SN", "GMB": "GM", "MLI": "ML",
+    "NER": "NE", "BFA": "BF", "UPV": "BF", "TGO": "TG",
+    "BEN": "BJ", "DAH": "BJ", "GNQ": "GQ", "SDN": "SD",
+    "TCD": "TD", "MDG": "MG", "MUS": "MU", "COM": "KM",
+    "CPV": "CV", "STP": "ST", "DJI": "DJ", "MRT": "MR",
+    # Americas
+    "MEX": "MX", "GTM": "GT", "BLZ": "BZ", "BHO": "BZ",
+    "HND": "HN", "SLV": "SV", "NIC": "NI", "CRI": "CR",
+    "PAN": "PA", "CUB": "CU", "HTI": "HT", "DOM": "DO",
+    "JAM": "JM", "TTO": "TT", "BRB": "BB", "GUY": "GY",
+    "SUR": "SR", "VEN": "VE", "COL": "CO", "ECU": "EC",
+    "PER": "PE", "BOL": "BO", "BRA": "BR", "PRY": "PY",
+    "URY": "UY", "ARG": "AR", "CHL": "CL",
+    # Oceania
+    "PNG": "PG", "SLB": "SB", "FJI": "FJ", "WSM": "WS",
+    "TON": "TO", "VUT": "VU",
+}
+
+# Reverse: ISO2 → list of game tags that map to it (for color lookup during render)
+_ISO2_TO_TAGS: dict[str, list[str]] = {}
+for _tag, _iso2 in TAG_TO_ISO2.items():
+    _ISO2_TO_TAGS.setdefault(_iso2, []).append(_tag)
+
 _WORLD_GDF: Optional[gpd.GeoDataFrame] = None
+_PROVINCE_GDF: Optional[gpd.GeoDataFrame] = None
 
 
 def _load_world_gdf() -> gpd.GeoDataFrame:
@@ -293,17 +370,67 @@ def _world() -> gpd.GeoDataFrame:
     return _WORLD_GDF
 
 
+def _province_gdf() -> gpd.GeoDataFrame:
+    """Build (once) a GeoDataFrame of all ArcGIS provinces with province_id and iso_cc columns."""
+    global _PROVINCE_GDF
+    if _PROVINCE_GDF is not None:
+        return _PROVINCE_GDF
+
+    provinces = arcgis_provinces.get_all()
+    rows = []
+    for pid, prov in provinces.items():
+        try:
+            geom = shape(prov.geometry)
+        except Exception:
+            continue
+        rows.append({
+            "province_id": pid,
+            "iso_cc": prov.iso_cc,
+            "name": prov.name,
+            "cx": prov.centroid[0],
+            "cy": prov.centroid[1],
+            "geometry": geom,
+        })
+    _PROVINCE_GDF = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    log.info("Built province GeoDataFrame with %d features", len(_PROVINCE_GDF))
+    return _PROVINCE_GDF
+
+
+def _tags_for_country_name(name: str) -> list[str]:
+    """Return all game tags whose 1970 map name matches a GeoJSON NAME."""
+    stripped = name.strip()
+    tags = [tag for tag, mapped in TAG_TO_NAME.items() if mapped.strip() == stripped]
+    if stripped.upper() not in tags:
+        tags.append(stripped.upper())
+    return tags
+
+
 def _name_to_color(
     name: str,
     occupation: dict[str, OccupiedNation],
 ) -> str:
     """Return player color if a tag maps to this country name, else gray."""
-    tag = _NAME_TO_TAG.get(name)
-    if tag and tag in occupation:
-        return occupation[tag].color
-    if name.upper() in occupation:
-        return occupation[name.upper()].color
+    for tag in _tags_for_country_name(name):
+        if tag in occupation:
+            return occupation[tag].color
     return UNOCCUPIED_COLOR
+
+
+def _name_to_factions(
+    name: str,
+    memberships: dict[str, list[FactionMembership]],
+) -> list[FactionMembership]:
+    """Return faction memberships for every map tag matching this country name."""
+    found: list[FactionMembership] = []
+    seen: set[tuple[str, str]] = set()
+    for tag in _tags_for_country_name(name):
+        for membership in memberships.get(tag, []):
+            key = (membership.name, membership.color)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(membership)
+    return found
 
 
 def _fill_colors(
@@ -313,99 +440,125 @@ def _fill_colors(
     return [_name_to_color(name, occupation) for name in world["NAME"]]
 
 
+def _faction_fill_colors(
+    world: gpd.GeoDataFrame,
+    memberships: dict[str, list[FactionMembership]],
+) -> list[str]:
+    colors = []
+    for name in world["NAME"]:
+        factions = _name_to_factions(name, memberships)
+        colors.append(factions[0].color if factions else UNOCCUPIED_COLOR)
+    return colors
+
+
 def _add_province_layer(
     ax,
-    province_definitions: dict,
     province_ownership: dict,
-    subdivided_tags: set[str],
-    occupation: Optional[dict] = None,
+    occupation: dict,
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     fontsize: int = 4,
-    show_labels: bool = True,
+    show_labels: bool = False,
+    crs: Optional[str] = None,
+    geo_xlim: Optional[tuple[float, float]] = None,
+    geo_ylim: Optional[tuple[float, float]] = None,
 ) -> None:
-    """Draw province cells (Layer 1) and their labels (Layer 2a) for subdivided nations.
+    """Draw real ArcGIS province divisions (always visible).
 
-    Colors fall back to the parent country's occupation color when no province
-    owner exists, so freshly-subdivided countries keep their nation color.
-    Provinces are batched by color for efficient rendering of large subdivision counts.
-    Labels are suppressed on the world map (show_labels=False) and visible on zoom.
+    Color priority per province:
+      1. Explicit owner color (from province_ownership)
+      2. Parent country occupation color (if the owning game tag is in occupation)
+      3. UNOCCUPIED_COLOR
+
+    On the world map labels are suppressed (show_labels=False); on zoom they show.
+    A single GeoDataFrame.plot() call handles all provinces for performance.
+    When crs is set the GDF is reprojected (world map); otherwise geographic
+    coordinates are used with xlim/ylim spatial filtering (zoom map).
+    geo_xlim/geo_ylim filter provinces by geographic centroid BEFORE reprojection
+    (used on zoom maps to avoid reprojecting the full global province set).
     """
-    if not province_definitions:
+    gdf = _province_gdf()
+    if gdf.empty:
         return
 
-    occ = occupation or {}
+    if crs:
+        # Geographic pre-filter before reprojection for performance
+        if geo_xlim or geo_ylim:
+            mask = pd.Series(True, index=gdf.index)
+            if geo_xlim:
+                mask &= gdf["cx"].between(geo_xlim[0], geo_xlim[1])
+            if geo_ylim:
+                mask &= gdf["cy"].between(geo_ylim[0], geo_ylim[1])
+            gdf = gdf[mask]
+        if gdf.empty:
+            return
+        gdf = gdf.to_crs(crs)
+    elif xlim or ylim:
+        # Spatial filter for zoom maps (geographic coords)
+        mask = pd.Series(True, index=gdf.index)
+        if xlim:
+            mask &= gdf["cx"].between(xlim[0], xlim[1])
+        if ylim:
+            mask &= gdf["cy"].between(ylim[0], ylim[1])
+        gdf = gdf[mask]
+        if gdf.empty:
+            return
 
-    # Collect renderable provinces, resolving fill color once per province.
-    color_groups: dict[str, list] = defaultdict(list)
-    label_items: list[tuple[float, float, str, object]] = []  # (cx, cy, label, ownership)
-
-    for pid, prov in province_definitions.items():
-        tag = prov.parent_tag
-        if tag not in subdivided_tags:
-            continue
-
-        cx, cy = prov.centroid
-        if xlim and not (xlim[0] <= cx <= xlim[1]):
-            continue
-        if ylim and not (ylim[0] <= cy <= ylim[1]):
-            continue
-
-        try:
-            geom = shape(prov.geometry)
-        except Exception:
-            continue
-
-        ownership = province_ownership.get(pid)
-        if ownership:
-            fill = ownership.color
-        elif tag in occ:
-            fill = occ[tag].color
+    # Build per-row color array
+    colors = []
+    for _, row in gdf.iterrows():
+        pid = row["province_id"]
+        iso_cc = row["iso_cc"]
+        own = province_ownership.get(pid)
+        if own:
+            colors.append(own.color)
         else:
-            fill = UNOCCUPIED_COLOR
+            parent_color = UNOCCUPIED_COLOR
+            for tag in _ISO2_TO_TAGS.get(iso_cc, []):
+                if tag in occupation:
+                    parent_color = occupation[tag].color
+                    break
+            colors.append(parent_color)
 
-        color_groups[fill].append(geom)
+    gdf.plot(
+        ax=ax,
+        color=colors,
+        edgecolor=_PROVINCE_BORDER_COLOR,
+        linewidth=0.15,
+        alpha=0.9,
+    )
 
-        if show_labels:
-            label = pid
-            if ownership:
-                label += f"\n{ownership.display_name[:12]}"
-            label_items.append((cx, cy, label, ownership))
-
-    # Batch plot all provinces sharing the same color in one GeoDataFrame call.
-    for color, geoms in color_groups.items():
-        gpd.GeoDataFrame(geometry=geoms, crs="EPSG:4326").plot(
-            ax=ax,
-            color=color,
-            edgecolor=_PROVINCE_BORDER_COLOR,
-            linewidth=0.3,
-            alpha=0.85,
-        )
-
-    for cx, cy, label, _ in label_items:
-        ax.annotate(
-            label,
-            xy=(cx, cy),
-            ha="center", va="center",
-            fontsize=fontsize, color="#111111",
-            bbox=dict(boxstyle="round,pad=0.08", fc="white", alpha=0.4, ec="none"),
-        )
+    if show_labels:
+        for _, row in gdf.iterrows():
+            pid = row["province_id"]
+            own = province_ownership.get(pid)
+            label = row["name"][:14]
+            if own:
+                label += f"\n{own.display_name[:12]}"
+            if crs:
+                centroid = row.geometry.centroid
+                cx, cy = centroid.x, centroid.y
+            else:
+                cx, cy = row["cx"], row["cy"]
+            ax.annotate(
+                label,
+                xy=(cx, cy),
+                ha="center", va="center",
+                fontsize=fontsize, color="#111111",
+                bbox=dict(boxstyle="round,pad=0.08", fc="white", alpha=0.4, ec="none"),
+            )
 
 
 def _add_labels(
     ax,
     world: gpd.GeoDataFrame,
     occupation: dict[str, OccupiedNation],
-    subdivided_tags: Optional[set[str]] = None,
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     fontsize: int = 5,
 ) -> None:
-    """Draw country-level labels (Layer 2b). Skips nations that are subdivided into provinces."""
-    skip = subdivided_tags or set()
+    """Draw country-level labels for occupied nations."""
     for tag, nation in occupation.items():
-        if tag in skip:
-            continue
         name = TAG_TO_NAME.get(tag)
         if name is None:
             continue
@@ -431,28 +584,92 @@ def _add_labels(
 def _render_world_sync(
     occupation: dict[str, OccupiedNation],
     province_ownership: dict,
-    province_definitions: dict,
-    subdivided_tags: set[str],
-    units: list,
 ) -> bytes:
     world = _world()
-    colors = _fill_colors(world, occupation)
+    world_proj = world.to_crs(_EQUAL_EARTH_CRS)
+    # Antarctica appears visually detached in Equal Earth projection — exclude it
+    world_proj = world_proj[world_proj["NAME"] != "Antarctica"]
+    colors = _fill_colors(world_proj, occupation)
 
-    fig, ax = plt.subplots(1, 1, figsize=(22, 11), facecolor=_OCEAN_COLOR)
+    fig, ax = plt.subplots(1, 1, figsize=(16, 9), facecolor=_OCEAN_COLOR)
     ax.set_facecolor(_OCEAN_COLOR)
-    world.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.4)
 
-    _add_province_layer(
-        ax, province_definitions, province_ownership, subdivided_tags,
-        occupation=occupation, fontsize=4, show_labels=False,
-    )
-    _add_labels(ax, world, occupation, subdivided_tags=subdivided_tags, fontsize=5)
+    # Layer 0: base nation fills (Equal Earth projection)
+    world_proj.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.4)
+
+    # Layer 1: province subdivisions (always visible, no labels at world scale)
+    _add_province_layer(ax, province_ownership, occupation, show_labels=False, crs=_EQUAL_EARTH_CRS)
+
+    # Layer 2: nation borders redrawn on top for clean outlines
+    world_proj.plot(ax=ax, color="none", edgecolor=_BORDER_COLOR, linewidth=0.5)
+
+    # Layer 3: country labels (centroids computed in projected space)
+    _add_labels(ax, world_proj, occupation, fontsize=5)
 
     ax.set_axis_off()
-    ax.set_title("DNC World Map — 1970", pad=8, fontsize=16, fontweight="bold")
+    ax.set_title("DNC World Map — 1970", pad=8, fontsize=16, fontweight="bold", color="white")
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _render_faction_world_sync(
+    memberships: dict[str, list[FactionMembership]],
+) -> bytes:
+    world = _world()
+    world_proj = world.to_crs(_EQUAL_EARTH_CRS)
+    world_proj = world_proj[world_proj["NAME"] != "Antarctica"]
+    colors = _faction_fill_colors(world_proj, memberships)
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 9), facecolor=_OCEAN_COLOR)
+    ax.set_facecolor(_OCEAN_COLOR)
+
+    world_proj.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.4)
+
+    for row_idx, row in world_proj.iterrows():
+        factions = _name_to_factions(row["NAME"], memberships)
+        if len(factions) < 2:
+            continue
+        feature = world_proj.loc[[row_idx]]
+        for hatch_idx, faction in enumerate(factions[1:]):
+            feature.plot(
+                ax=ax,
+                facecolor="none",
+                edgecolor=faction.color,
+                linewidth=0.15,
+                hatch=_FACTION_HATCHES[hatch_idx % len(_FACTION_HATCHES)],
+            )
+
+    world_proj.plot(ax=ax, color="none", edgecolor=_BORDER_COLOR, linewidth=0.5)
+
+    legend_items: dict[str, str] = {}
+    for faction_list in memberships.values():
+        for faction in faction_list:
+            legend_items.setdefault(faction.name, faction.color)
+    if legend_items:
+        handles = [
+            Patch(facecolor=color, edgecolor=_BORDER_COLOR, label=name)
+            for name, color in legend_items.items()
+        ]
+        ncol = 1 if len(handles) <= 12 else 2
+        ax.legend(
+            handles=handles,
+            title="Factions",
+            loc="lower left",
+            fontsize=8,
+            title_fontsize=9,
+            framealpha=0.9,
+            ncol=ncol,
+        )
+
+    ax.set_axis_off()
+    ax.set_title("DNC Faction Map — 1970", pad=8, fontsize=16, fontweight="bold", color="white")
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -462,9 +679,6 @@ def _render_zoom_sync(
     iso_tag: str,
     occupation: dict[str, OccupiedNation],
     province_ownership: dict,
-    province_definitions: dict,
-    subdivided_tags: set[str],
-    units: list,
     buffer_deg: float,
 ) -> bytes:
     world = _world()
@@ -477,39 +691,76 @@ def _render_zoom_sync(
     if target.empty:
         raise ValueError(f"Country '{name}' not found in 1970 map dataset")
 
-    bounds = target.total_bounds  # (minx, miny, maxx, maxy)
-    xlim = (bounds[0] - buffer_deg, bounds[2] + buffer_deg)
-    ylim = (bounds[1] - buffer_deg, bounds[3] + buffer_deg)
-    colors = _fill_colors(world, occupation)
+    # Geographic bounds in EPSG:4326 (may exceed ±180° for Russia)
+    geo_bounds = target.total_bounds  # (minx, miny, maxx, maxy)
 
-    fig, ax = plt.subplots(1, 1, figsize=(14, 9), facecolor=_OCEAN_COLOR)
+    # Projection center clamped to valid lon/lat — handles antimeridian-spanning
+    # countries (e.g. USSR extends past 180°E) that break raw geographic axes.
+    lon_0 = round((max(-180.0, geo_bounds[0]) + min(180.0, geo_bounds[2])) / 2, 4)
+    lat_0 = round((geo_bounds[1] + geo_bounds[3]) / 2, 4)
+    lat_0 = max(-89.0, min(89.0, lat_0))  # avoid aeqd singularity at poles
+
+    # Local azimuthal equidistant projection centered on the country.
+    # Correctly wraps antimeridian-spanning geometries (Russia, etc.).
+    local_crs = (
+        f"+proj=aeqd +lat_0={lat_0} +lon_0={lon_0} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+
+    world_proj = world.to_crs(local_crs)
+    target_proj = world_proj[world_proj["NAME"] == name]
+    colors = _fill_colors(world_proj, occupation)
+
+    # Bounds in projected meters; convert buffer from degrees (≈111 km/°)
+    bounds = target_proj.total_bounds
+    buf_m = buffer_deg * 111_000
+    xlim = (bounds[0] - buf_m, bounds[2] + buf_m)
+    ylim = (bounds[1] - buf_m, bounds[3] + buf_m)
+
+    # Geographic pre-filter for province layer — skip lon pre-filter for
+    # antimeridian-spanning countries (their cx values may scatter across ±180°)
+    geo_pad = buffer_deg + 5
+    geo_xlim: Optional[tuple[float, float]] = (
+        max(-180.0, geo_bounds[0] - geo_pad),
+        min(180.0, geo_bounds[2] + geo_pad),
+    )
+    geo_ylim: Optional[tuple[float, float]] = (
+        max(-90.0, geo_bounds[1] - geo_pad),
+        min(90.0, geo_bounds[3] + geo_pad),
+    )
+    if geo_bounds[2] - geo_bounds[0] > 150:
+        geo_xlim = None  # antimeridian-crossing country — lat filter is enough
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10), facecolor=_OCEAN_COLOR)
     ax.set_facecolor(_OCEAN_COLOR)
-    world.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
-
-    target_color = occupation[tag].color if tag in occupation else UNOCCUPIED_COLOR
-    target.plot(ax=ax, color=target_color, edgecolor=_HIGHLIGHT_EDGE, linewidth=2.5)
-
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
 
+    # Layer 0: base nation fills (local projection)
+    world_proj.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
+
+    # Layer 1: province subdivisions with labels at zoom scale
     _add_province_layer(
-        ax, province_definitions, province_ownership, subdivided_tags,
-        occupation=occupation, xlim=xlim, ylim=ylim, fontsize=6, show_labels=True,
+        ax, province_ownership, occupation,
+        fontsize=6, show_labels=True, crs=local_crs,
+        geo_xlim=geo_xlim, geo_ylim=geo_ylim,
     )
-    _add_labels(
-        ax, world, occupation,
-        subdivided_tags=subdivided_tags,
-        xlim=xlim, ylim=ylim, fontsize=7,
-    )
+
+    # Layer 2: highlighted target country border redrawn on top
+    target_proj.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.5)
+
+    # Layer 3: country labels (centroids in projected coords)
+    _add_labels(ax, world_proj, occupation, xlim=xlim, ylim=ylim, fontsize=7)
+
     ax.set_axis_off()
 
     title = tag
     if tag in occupation:
         title += f"  —  {occupation[tag].display_name}"
-    ax.set_title(title, pad=8, fontsize=16, fontweight="bold")
+    ax.set_title(title, pad=8, fontsize=16, fontweight="bold", color="white")
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -518,9 +769,8 @@ def _render_zoom_sync(
 async def render_world_map(
     occupation: dict[str, OccupiedNation],
     province_ownership: Optional[dict] = None,
-    province_definitions: Optional[dict] = None,
-    subdivided_tags: Optional[set[str]] = None,
-    units: Optional[list] = None,
+    # Legacy kwargs accepted and ignored for backward compatibility
+    **_,
 ) -> bytes:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -529,9 +779,21 @@ async def render_world_map(
             _render_world_sync,
             occupation,
             province_ownership or {},
-            province_definitions or {},
-            subdivided_tags or set(),
-            units or [],
+        ),
+    )
+
+
+async def render_faction_map(
+    memberships: dict[str, list[FactionMembership]],
+    # Legacy kwargs accepted and ignored for forward compatibility
+    **_,
+) -> bytes:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            _render_faction_world_sync,
+            memberships,
         ),
     )
 
@@ -540,10 +802,9 @@ async def render_zoom_map(
     iso_tag: str,
     occupation: dict[str, OccupiedNation],
     province_ownership: Optional[dict] = None,
-    province_definitions: Optional[dict] = None,
-    subdivided_tags: Optional[set[str]] = None,
-    units: Optional[list] = None,
     buffer_deg: float = 5.0,
+    # Legacy kwargs accepted and ignored for backward compatibility
+    **_,
 ) -> bytes:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
@@ -553,9 +814,6 @@ async def render_zoom_map(
             iso_tag,
             occupation,
             province_ownership or {},
-            province_definitions or {},
-            subdivided_tags or set(),
-            units or [],
             buffer_deg,
         ),
     )

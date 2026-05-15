@@ -1,0 +1,25 @@
+# DNC faction memberships.
+# Edit this file while the bot is running; !DNC mapfaction reloads it each time.
+#
+# Format:
+# [NATO]
+# color = #457b9d
+# members = USA, GBR, FRA, FRG, TUR, GRC
+#
+# Countries can appear in multiple factions. The faction map will render the
+# first listed faction as the base fill and later factions as hatch overlays.
+
+[NATO]
+color = #457b9d
+members =
+    USA
+    GBR
+    FRG
+    TUR
+    GRC
+    FRA
+
+[Warsaw Pact]
+color = #457b9d
+members =
+    RUS

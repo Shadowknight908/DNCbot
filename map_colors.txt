@@ -2,9 +2,15 @@ AUS #e9c46a
 CHN #118ab2
 DEU #f4a261
 FRA #2a9d8f
+FRG #ef476f
+GBR #3a0ca3
 GRC #457b9d
 HND #06d6a0
+ISR #f72585
+NER #7209b7
+PRK #4cc9f0
 RHO #ff595e
+RUS #ffd166
 TUR #ffca3a
 USA #e63946
 USSR #6a4c93
