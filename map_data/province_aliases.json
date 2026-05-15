@@ -1,0 +1,29 @@
+{
+  "_comment": "Common / historical / colloquial place names → province IDs or ISO2 country codes. Keys are matched case-insensitively (whitespace/punctuation tolerant). Values are either a single ID/code string OR a list of them. Province IDs look like 'CN-65'. Country codes are 2-letter ISO2 ('IR', 'CN'). The LLM tool lookup_province handles both — country codes resolve to a country meta-record so the model can follow up with provinces_in_country.",
+
+  "Persia": "IR",
+  "Siam": "TH",
+  "Ceylon": "LK",
+  "Burma": "MM",
+  "Formosa": "TW",
+  "Holland": "NL",
+  "Soviet Union": "RU",
+  "USSR": "RU",
+  "Red China": "CN",
+  "Mainland China": "CN",
+  "Czechoslovakia": "CZ",
+  "Yugoslavia": "RS",
+
+  "Indochina": ["VN", "LA", "KH"],
+  "Caucasus": ["GE", "AM", "AZ"],
+  "Maghreb": ["MA", "DZ", "TN", "LY"],
+  "Levant": ["SY", "LB", "JO", "IL"],
+  "Horn of Africa": ["ET", "ER", "SO", "DJ"],
+  "Scandinavia": ["NO", "SE", "DK", "FI"],
+  "Nordics": ["NO", "SE", "DK", "FI", "IS"],
+  "Baltics": ["EE", "LV", "LT"],
+  "Iberia": ["ES", "PT"],
+  "British Isles": ["GB", "IE"],
+  "Benelux": ["BE", "NL", "LU"],
+  "Central Asia": ["KZ", "UZ", "TM", "TJ", "KG"]
+}

@@ -102,6 +102,7 @@ class InferenceClient:
         thinking_budget: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_executor: Optional[Callable] = None,
+        max_tool_depth: int = 3,
         _tool_depth: int = 0,
     ) -> Tuple[str, Dict[str, int]]:
         """Multi-turn chat using SSE streaming.
@@ -111,8 +112,9 @@ class InferenceClient:
         Inline <think>…</think> tags in the content are stripped and echoed to
         console after the stream ends.
 
-        If tools and tool_executor are provided, the model may call tools. Results
-        are fed back automatically (up to 3 rounds) before the final reply.
+        If tools and tool_executor are provided, the model may call tools.
+        Results are fed back automatically up to `max_tool_depth` rounds
+        (default 3) before the final reply is returned.
         """
         payload: Dict[str, Any] = {
             "model": model or self.chat_model,
@@ -138,7 +140,7 @@ class InferenceClient:
                 # Some providers require top-level max_tokens > reasoning max_tokens
                 if "max_tokens" not in payload:
                     payload["max_tokens"] = thinking_budget + 4096
-        if tools and _tool_depth < 3:
+        if tools and _tool_depth < max_tool_depth:
             payload["tools"] = tools
 
         content_parts: List[str] = []
@@ -220,7 +222,7 @@ class InferenceClient:
         first_usage = self._extract_usage({"usage": usage_data})
 
         # If the model made tool calls, execute them and loop
-        if tool_calls_acc and tool_executor is not None and _tool_depth < 3:
+        if tool_calls_acc and tool_executor is not None and _tool_depth < max_tool_depth:
             calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             tool_call_objs = [
                 {
@@ -256,6 +258,7 @@ class InferenceClient:
                 top_p=top_p, top_k=top_k, max_tokens=max_tokens,
                 thinking_budget=thinking_budget,
                 tools=tools, tool_executor=tool_executor,
+                max_tool_depth=max_tool_depth,
                 _tool_depth=_tool_depth + 1,
             )
             merged = {

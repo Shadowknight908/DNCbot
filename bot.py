@@ -3266,31 +3266,19 @@ class LoreBot(commands.Bot):
             await message.reply("That message has no text content.")
             return
 
+        # Province context is now just the current ownership snapshot — the
+        # LLM uses geometry tools to enumerate provinces, so we no longer
+        # need to dump the full province list into the prompt.
         ownership = self.province_store.get_ownership()
-        # Build province context limited to occupied countries (keeps LLM prompt size manageable)
-        occupation = self.map_store.get_occupation()
-        occupied_iso2 = {map_renderer.TAG_TO_ISO2[t] for t in occupation if t in map_renderer.TAG_TO_ISO2}
-        iso2_to_primary = {}
-        for t, iso2 in map_renderer.TAG_TO_ISO2.items():
-            iso2_to_primary.setdefault(iso2, t)
-
-        import arcgis_provinces as _ap
-        province_context = {}
-        for pid, p in _ap.get_all().items():
-            if p.iso_cc not in occupied_iso2 and pid not in ownership:
-                continue
-            province_context[pid] = {
-                "parent_tag": iso2_to_primary.get(p.iso_cc, p.iso_cc),
-                "name": p.name,
-                "owner": ownership[pid].display_name if pid in ownership else None,
-            }
-
-        if not province_context:
-            await message.reply("No provinces in occupied countries found. Occupy a country first with `!DNC mapset`.")
-            return
+        province_context = {
+            pid: {"owner": o.player_tag, "display_name": o.display_name}
+            for pid, o in ownership.items()
+        }
 
         map_cfg = self.cfg.get("spatial_mapping", {})
         model = map_cfg.get("map_llm_model") or None
+        thinking_budget = map_cfg.get("map_llm_thinking_budget")
+        max_tool_depth = int(map_cfg.get("map_llm_max_tool_depth", 6) or 6)
         tavily_enabled = (
             self.tavily is not None
             and self.cfg.get("tavily", {}).get("enabled_modes", {}).get("mapparse", False)
@@ -3301,15 +3289,19 @@ class LoreBot(commands.Bot):
                 changes = await map_llm.parse_post_for_changes(
                     post_text, province_context, self.llm, model=model,
                     tavily=self.tavily if tavily_enabled else None,
+                    thinking_budget=thinking_budget,
+                    max_tool_depth=max_tool_depth,
                 )
             except Exception as e:
                 await message.reply(f"LLM analysis failed: {e}")
                 return
 
-        summary = map_llm.format_change_summary(changes, self.province_store)
+        valid_changes, invalid_changes = map_llm.validate_proposals(changes)
+        summary = map_llm.format_change_summary(valid_changes, self.province_store, invalid_changes)
         if len(summary) > 4000:
             summary = summary[:3950] + "\n…*(summary truncated)*"
         confirm_msg = await message.reply(summary)
+        changes = valid_changes
 
         if not changes:
             return
@@ -3334,24 +3326,9 @@ class LoreBot(commands.Bot):
             await confirm_msg.reply("Cancelled — no changes applied.")
             return
 
-        applied, errors = 0, []
-        for ch in changes:
-            action = ch.get("action")
-            pid = ch.get("province_id", "").upper()
-            try:
-                if action == "assign_province":
-                    player_tag = ch.get("player_tag", "").upper()
-                    self.province_store.assign(pid, player_tag, "", player_tag)
-                    applied += 1
-                elif action == "release_province":
-                    self.province_store.release(pid)
-                    applied += 1
-                elif action == "transfer_province":
-                    to_tag = ch.get("to_tag", "").upper()
-                    self.province_store.assign(pid, to_tag, "", to_tag)
-                    applied += 1
-            except Exception as e:
-                errors.append(f"`{pid}`: {e}")
+        applied, errors = self._apply_map_proposals(
+            changes, command="mapparse", actor=str(message.author),
+        )
 
         self.flog.log_command("mapparse", str(message.author), message.channel.name, arg)
 
@@ -3370,43 +3347,70 @@ class LoreBot(commands.Bot):
             except Exception as e:
                 await confirm_msg.reply("\n".join(result_lines) + f"\n(Render failed: {e})")
 
+    def _apply_map_proposals(
+        self, changes: list[dict], *, command: str, actor: str,
+    ) -> tuple[int, list[str]]:
+        """Apply a validated list of map-change proposals.
+
+        Returns (applied_count, errors). Each applied operation is recorded
+        to logs/map_changes.log.
+        """
+        applied = 0
+        errors: list[str] = []
+        for ch in changes:
+            action = ch.get("action")
+            pid = (ch.get("province_id") or "").upper()
+            reason = ch.get("reason", "")
+            try:
+                if action == "assign_province":
+                    player_tag = (ch.get("player_tag") or "").upper()
+                    self.province_store.assign(pid, player_tag, "", player_tag)
+                    self.flog.log_map_change(
+                        command, actor, "assign", pid,
+                        player_tag=player_tag, reason=reason,
+                    )
+                    applied += 1
+                elif action == "release_province":
+                    self.province_store.release(pid)
+                    self.flog.log_map_change(
+                        command, actor, "release", pid, reason=reason,
+                    )
+                    applied += 1
+                elif action == "transfer_province":
+                    to_tag = (ch.get("to_tag") or "").upper()
+                    from_tag = (ch.get("from_tag") or "").upper()
+                    self.province_store.assign(pid, to_tag, "", to_tag)
+                    self.flog.log_map_change(
+                        command, actor, "transfer", pid,
+                        from_tag=from_tag, to_tag=to_tag, reason=reason,
+                    )
+                    applied += 1
+            except Exception as e:
+                errors.append(f"`{pid}`: {e}")
+        return applied, errors
+
     async def _cmd_mapchange(self, message: discord.Message, arg: str) -> None:
         """!DNC mapchange <instructions> — LLM applies direct map ownership changes."""
         instructions = arg.strip()
         if not instructions:
             await message.reply(
                 f"Usage: `{self.prefix} mapchange <instructions>`\n"
-                f"Example: `{self.prefix} mapchange Assign Bavaria and Baden to FRG, release Hamburg`"
+                f"Example: `{self.prefix} mapchange Russia invades northern China 450 miles from Xinjiang`"
             )
             return
 
         map_cfg = self.cfg.get("spatial_mapping", {})
         ownership = self.province_store.get_ownership()
-
-        import arcgis_provinces as _ap
-        all_provinces = _ap.get_all()
-
-        # Include all provinces from game-tagged countries + any currently owned province
-        relevant_iso2 = set(map_renderer.TAG_TO_ISO2.values())
-        iso2_to_primary_tag: dict[str, str] = {}
-        for tag, iso2 in map_renderer.TAG_TO_ISO2.items():
-            iso2_to_primary_tag.setdefault(iso2, tag)
-
-        province_context: dict = {}
-        for pid, p in all_provinces.items():
-            if p.iso_cc not in relevant_iso2 and pid not in ownership:
-                continue
-            province_context[pid] = {
-                "parent_tag": iso2_to_primary_tag.get(p.iso_cc, p.iso_cc),
-                "name": p.name,
-                "owner": ownership[pid].display_name if pid in ownership else None,
-            }
-
-        if not province_context:
-            await message.reply("No province data available.")
-            return
+        # Hand the LLM only the current ownership snapshot — it discovers the
+        # province universe through geometry tools instead of a flat dump.
+        province_context = {
+            pid: {"owner": o.player_tag, "display_name": o.display_name}
+            for pid, o in ownership.items()
+        }
 
         model = map_cfg.get("map_llm_model") or None
+        thinking_budget = map_cfg.get("map_llm_thinking_budget")
+        max_tool_depth = int(map_cfg.get("map_llm_max_tool_depth", 6) or 6)
         tavily_enabled = (
             self.tavily is not None
             and self.cfg.get("tavily", {}).get("enabled_modes", {}).get("mapchange", False)
@@ -3417,15 +3421,19 @@ class LoreBot(commands.Bot):
                 changes = await map_llm.process_map_instructions(
                     instructions, province_context, self.llm, model=model,
                     tavily=self.tavily if tavily_enabled else None,
+                    thinking_budget=thinking_budget,
+                    max_tool_depth=max_tool_depth,
                 )
             except Exception as e:
                 await message.reply(f"LLM processing failed: {e}")
                 return
 
-        summary = map_llm.format_change_summary(changes, self.province_store)
+        valid_changes, invalid_changes = map_llm.validate_proposals(changes)
+        summary = map_llm.format_change_summary(valid_changes, self.province_store, invalid_changes)
         if len(summary) > 4000:
             summary = summary[:3950] + "\n…*(summary truncated)*"
         confirm_msg = await message.reply(summary)
+        changes = valid_changes
 
         if not changes:
             return
@@ -3450,24 +3458,9 @@ class LoreBot(commands.Bot):
             await confirm_msg.reply("Cancelled — no changes applied.")
             return
 
-        applied, errors = 0, []
-        for ch in changes:
-            action = ch.get("action")
-            pid = ch.get("province_id", "").upper()
-            try:
-                if action == "assign_province":
-                    player_tag = ch.get("player_tag", "").upper()
-                    self.province_store.assign(pid, player_tag, "", player_tag)
-                    applied += 1
-                elif action == "release_province":
-                    self.province_store.release(pid)
-                    applied += 1
-                elif action == "transfer_province":
-                    to_tag = ch.get("to_tag", "").upper()
-                    self.province_store.assign(pid, to_tag, "", to_tag)
-                    applied += 1
-            except Exception as e:
-                errors.append(f"`{pid}`: {e}")
+        applied, errors = self._apply_map_proposals(
+            changes, command="mapchange", actor=str(message.author),
+        )
 
         self.flog.log_command("mapchange", str(message.author), message.channel.name, instructions[:120])
 
