@@ -116,9 +116,66 @@ _DOC_CHUNK_CHARS = 4500
 _DOC_CHUNK_OVERLAP = 400
 _ARCHIVIST_INPUT_CHARS = 60000
 _EMBED_INPUT_CHARS = 30000
-_GM_PRIOR_CONTEXT_CHARS = 120000
-_GM_WIDER_CONTEXT_CHARS = 100000
+_GM_PRIOR_CONTEXT_CHARS = 150000
+_GM_WIDER_CONTEXT_CHARS = 120000
 _GM_CONTEXT_ITEM_CHARS = 30000
+
+_ARCHIVIST_VALID_ACTION_TYPES = {
+    "internal", "military", "economic", "diplomatic", "cultural", "other",
+}
+
+
+def _parse_archivist_output(raw: str) -> tuple[str, dict]:
+    """Split the Archivist response into (summary, tags_dict).
+
+    Expected shape:
+        SUMMARY:
+        <prose>
+
+        TAGS:
+        entities: ...
+        action_type: ...
+        claims: ...
+
+    On any parse failure, returns (raw, {}). NO_LORE responses pass through
+    as summary with empty tags.
+    """
+    tags: dict[str, str] = {"entities": "", "action_type": "", "claims": ""}
+    if not raw:
+        return "", tags
+
+    if raw.strip().upper().startswith("NO_LORE"):
+        return raw, tags
+
+    # Locate TAGS: as its own line (case-sensitive, line-anchored)
+    m = re.search(r"(?im)^\s*TAGS:\s*$", raw)
+    if not m:
+        # No tags block — strip a leading SUMMARY: line if present, return the rest
+        stripped = re.sub(r"(?im)^\s*SUMMARY:\s*\n?", "", raw, count=1).strip()
+        return stripped or raw.strip(), tags
+
+    summary_section = raw[:m.start()]
+    tags_section = raw[m.end():]
+    summary = re.sub(r"(?im)^\s*SUMMARY:\s*\n?", "", summary_section, count=1).strip()
+    if not summary:
+        summary = raw.strip()
+
+    for line in tags_section.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "entities":
+            tags["entities"] = val
+        elif key == "action_type":
+            v = val.lower().split()[0] if val else ""
+            tags["action_type"] = v if v in _ARCHIVIST_VALID_ACTION_TYPES else ""
+        elif key == "claims":
+            tags["claims"] = val
+
+    return summary, tags
 
 
 def _doc_attachment_type(a: discord.Attachment) -> str | None:
@@ -476,6 +533,71 @@ class LoreBot(commands.Bot):
             "max_tokens":      mode_cfg.get("max_tokens"),
             "thinking_budget": mode_cfg.get("thinking_budget"),
         }
+
+    def _gm_retrieval_cfg(self) -> dict:
+        """Read gm.retrieval config block with safe defaults."""
+        r = (self.cfg.get("gm") or {}).get("retrieval") or {}
+        return {
+            "author_recency_top_n": int(r.get("author_recency_top_n", 30)),
+            "author_semantic_top_k": int(r.get("author_semantic_top_k", 15)),
+            "wider_top_k": int(r.get("wider_top_k", 15)),
+            "include_author_in_wider": bool(r.get("include_author_in_wider", True)),
+            "expand_queries": bool(r.get("expand_queries", True)),
+            "expansion_model": r.get("expansion_model") or "mistralai/ministral-14b-2512",
+            "expansion_max_queries": int(r.get("expansion_max_queries", 4)),
+            "action_type_boost": bool(r.get("action_type_boost", True)),
+        }
+
+    async def _gm_expand_queries(
+        self, action_text: str, max_queries: int = 4, model: str | None = None,
+    ) -> tuple[list[str], Optional[str]]:
+        """Generate search queries and infer an action_type for GM retrieval.
+
+        Returns (queries, action_type_or_None). On failure returns ([], None).
+        """
+        if not action_text.strip():
+            return [], None
+        sys_prompt = (
+            "You are a search-query generator for a roleplay archive. "
+            "Given an action being adjudicated, output:\n"
+            "Line 1: ACTION_TYPE: <internal|military|economic|diplomatic|cultural|other>\n"
+            f"Lines 2-{max_queries + 1}: short search queries (one per line, no numbering, "
+            "no questions) that would surface relevant prior context — named entities, "
+            "prerequisites the action assumes, claims being built upon.\n"
+            "Each query is a short noun phrase or assertion. Output only those lines."
+        )
+        try:
+            kwargs = {"temperature": 0.2}
+            if model:
+                kwargs["model"] = model
+            raw, usage = await self.llm.chat(
+                sys_prompt,
+                _trim_context_text(action_text, _EMBED_INPUT_CHARS),
+                **kwargs,
+            )
+            self.state.add_usage("archivist", usage)
+        except Exception:
+            log.exception("GM query expansion failed; continuing with original action text only")
+            return [], None
+
+        action_type: Optional[str] = None
+        queries: list[str] = []
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.upper().startswith("ACTION_TYPE:"):
+                v = line.split(":", 1)[1].strip().lower().split()[:1]
+                if v and v[0] in _ARCHIVIST_VALID_ACTION_TYPES:
+                    action_type = v[0]
+                continue
+            # Strip common list prefixes the model might add
+            cleaned = re.sub(r"^[\-\*\d\.\)\s]+", "", line).strip()
+            if cleaned and len(cleaned) <= 200:
+                queries.append(cleaned)
+            if len(queries) >= max_queries:
+                break
+        return queries, action_type
 
     def _parse_date(self, date_str: str) -> Optional[datetime]:
         """Attempt to parse common date formats into UTC datetimes."""
@@ -1031,32 +1153,130 @@ class LoreBot(commands.Bot):
         dest = output_channel or invocation.channel
         try:
             async with dest.typing():
-                # Retrieve the author's prior posts (before the action's timestamp)
-                priors = self.memory.get_by_author_before(
-                    str(target_msg.author.id),
-                    target_msg.created_at.isoformat(),
-                )
+                gm_rcfg = self._gm_retrieval_cfg()
+                target_author_id = str(target_msg.author.id)
+                action_iso = target_msg.created_at.isoformat()
+                is_replacement = bool(revision_request) or is_reroll
 
-                # Sort priors newest-first, take up to 15 to keep tokens bounded
-                priors.sort(key=lambda m: m["metadata"].get("timestamp", ""),
-                            reverse=True)
-                priors = priors[:15]
+                # --- Determine ruling ID up front so it can be injected into the prompt ---
+                ruling_id: Optional[str] = None
+                if is_replacement:
+                    # Revisions/rerolls keep the original ID
+                    existing = self.memory.get_rulings_by_target_message(str(target_msg.id))
+                    for old in existing:
+                        rid = (old.get("metadata") or {}).get("ruling_id") or ""
+                        if rid:
+                            ruling_id = rid
+                            break
+                if not ruling_id:
+                    seq = self.state.next_ruling_id(self.state.current_year)
+                    ruling_id = f"GM-{self.state.current_year}-{seq:04d}"
 
-                # Build prior posts block
-                if priors:
+                # --- Collect the full action: may span multiple consecutive posts ---
+                chain_msgs = await self._gather_action_chain(target_msg)
+                if len(chain_msgs) > 1:
+                    action_text = "\n\n".join(
+                        await self._message_text_with_documents(m)
+                        for m in chain_msgs
+                        if (m.content or "").strip() or any(_doc_attachment_type(a) for a in m.attachments)
+                    )
+                else:
+                    action_text = await self._message_text_with_documents(target_msg)
+
+                # --- Optional LLM query expansion (entities, prerequisites, action_type) ---
+                expansion_queries: list[str] = []
+                inferred_action_type: Optional[str] = None
+                if action_text and gm_rcfg["expand_queries"]:
+                    expansion_queries, inferred_action_type = await self._gm_expand_queries(
+                        action_text,
+                        max_queries=gm_rcfg["expansion_max_queries"],
+                        model=gm_rcfg["expansion_model"],
+                    )
+                    if expansion_queries or inferred_action_type:
+                        print(f"{_C_DIM}[GM EXP    ] action_type={inferred_action_type or '-'} "
+                              f"queries={expansion_queries}{_C_RST}", flush=True)
+
+                # --- Embed the action text (and any expansion queries) ---
+                action_embed: Optional[list] = None
+                expansion_embeds: list[list] = []
+                if action_text:
+                    try:
+                        search_text = _trim_context_text(action_text, _EMBED_INPUT_CHARS)
+                        print(f"{_C_SEND}[GM EMB   →] action text {len(search_text)} chars{_C_RST}", flush=True)
+                        action_embed, embed_usage = await self.llm.embed(search_text)
+                        self.state.add_usage("embedding", embed_usage)
+                        print(f"{_C_RECV}[GM EMB   ←] dims={len(action_embed)}{_C_RST}", flush=True)
+                    except Exception:
+                        log.exception("Action embedding failed; wider/semantic-prior retrieval disabled")
+                for q in expansion_queries:
+                    try:
+                        e, u = await self.llm.embed(q)
+                        self.state.add_usage("embedding", u)
+                        expansion_embeds.append(e)
+                    except Exception:
+                        log.exception("Expansion query embedding failed for %r; skipping", q[:80])
+
+                all_query_embeds: list[list] = []
+                if action_embed:
+                    all_query_embeds.append(action_embed)
+                all_query_embeds.extend(expansion_embeds)
+
+                # --- Retrieve author priors: recency pass + semantic pass, deduped ---
+                recency_priors = self.memory.get_by_author_before(target_author_id, action_iso)
+                recency_priors.sort(key=lambda m: m["metadata"].get("timestamp", ""), reverse=True)
+                recency_priors = recency_priors[:gm_rcfg["author_recency_top_n"]]
+                recency_keys = {
+                    p["metadata"].get("source_message_id") or p["id"]
+                    for p in recency_priors
+                }
+                for p in recency_priors:
+                    p["_source"] = "recency"
+
+                semantic_prior_hits: list[dict] = []
+                if all_query_embeds:
+                    seen_ids: set[str] = set()
+                    best_by_id: dict[str, dict] = {}
+                    for emb in all_query_embeds:
+                        try:
+                            hits = self.memory.search(
+                                emb,
+                                top_k=gm_rcfg["author_semantic_top_k"],
+                                where={"author_id": target_author_id},
+                            )
+                        except Exception:
+                            log.exception("Author-semantic search failed for one query; skipping")
+                            continue
+                        for h in hits:
+                            ts = (h["metadata"].get("timestamp") or "")
+                            if ts >= action_iso:
+                                continue
+                            key = h["metadata"].get("source_message_id") or h["id"]
+                            if key in recency_keys:
+                                continue
+                            prev = best_by_id.get(key)
+                            if (prev is None) or (h.get("distance", 1.0) < prev.get("distance", 1.0)):
+                                best_by_id[key] = h
+                            seen_ids.add(key)
+                    for h in best_by_id.values():
+                        h["_source"] = "semantic"
+                    semantic_prior_hits = list(best_by_id.values())
+
+                merged_priors = recency_priors + semantic_prior_hits
+                merged_priors.sort(key=lambda m: m["metadata"].get("timestamp", ""), reverse=True)
+
+                if merged_priors:
                     prior_lines = []
                     remaining_prior_chars = _GM_PRIOR_CONTEXT_CHARS
-                    for p in priors:
+                    for p in merged_priors:
                         meta = p["metadata"]
-                        full = meta.get("full_message_text", "") or meta.get(
-                            "original_excerpt", "")
+                        full = meta.get("full_message_text", "") or meta.get("original_excerpt", "")
                         full = _trim_context_text(
-                            full,
-                            min(_GM_CONTEXT_ITEM_CHARS, remaining_prior_chars),
+                            full, min(_GM_CONTEXT_ITEM_CHARS, remaining_prior_chars),
                         )
                         remaining_prior_chars = max(0, remaining_prior_chars - len(full))
+                        tag = "[semantic match]" if p.get("_source") == "semantic" else "[recency]"
                         prior_lines.append(
-                            f"[{str(meta.get('timestamp', ''))[:10]}, "
+                            f"{tag} [{str(meta.get('timestamp', ''))[:10]}, "
                             f"#{meta.get('channel', '?')}, year {meta.get('year', '?')}]\n"
                             f"Summary: {p['text']}\n"
                             f"Full post: {full}"
@@ -1069,59 +1289,83 @@ class LoreBot(commands.Bot):
                     priors_block = ("(No prior posts archived for this author. "
                                     "The author has not established context.)")
 
-                # Collect the full action: may span multiple consecutive posts
-                chain_msgs = await self._gather_action_chain(target_msg)
-                if len(chain_msgs) > 1:
-                    action_text = "\n\n".join(
-                        await self._message_text_with_documents(m)
-                        for m in chain_msgs
-                        if (m.content or "").strip() or any(_doc_attachment_type(a) for a in m.attachments)
-                    )
-                else:
-                    action_text = await self._message_text_with_documents(target_msg)
-
-                # Build wider context: top-K semantic search on the action text
+                # --- Wider semantic context: no longer excludes author; deduped vs priors ---
                 wider_block = ""
-                if action_text:
-                    try:
-                        search_text = _trim_context_text(action_text, _EMBED_INPUT_CHARS)
-                        print(f"{_C_SEND}[GM EMB   →] action text {len(search_text)} chars{_C_RST}", flush=True)
-                        embed, embed_usage = await self.llm.embed(search_text)
-                        self.state.add_usage("embedding", embed_usage)
-                        print(f"{_C_RECV}[GM EMB   ←] dims={len(embed)}  hits=5 (wider context){_C_RST}", flush=True)
-                        wider_hits = self.memory.search(embed, top_k=5)
-                        # Filter out the author's own posts (already in priors_block)
-                        wider_hits = [
-                            h for h in wider_hits
-                            if h["metadata"].get("author_id") != str(target_msg.author.id)
-                        ]
-                        if wider_hits:
-                            wider_lines = []
-                            remaining_wider_chars = _GM_WIDER_CONTEXT_CHARS
-                            for h in wider_hits:
-                                meta = h["metadata"]
-                                full = meta.get("full_message_text", "") or meta.get(
-                                    "original_excerpt", "")
-                                full = _trim_context_text(
-                                    full,
-                                    min(_GM_CONTEXT_ITEM_CHARS, remaining_wider_chars),
-                                )
-                                remaining_wider_chars = max(0, remaining_wider_chars - len(full))
-                                wider_lines.append(
-                                    f"[{str(meta.get('timestamp', ''))[:10]}, "
-                                    f"by {meta.get('author_name', '?')}, "
-                                    f"#{meta.get('channel', '?')}]\n"
-                                    f"Summary: {h['text']}\n"
-                                    f"Full post/document excerpt: {full}"
-                                )
-                                if remaining_wider_chars <= 0:
-                                    wider_lines.append("[Additional wider-context hits omitted to keep GM context within budget.]")
-                                    break
-                            wider_block = "\n\n".join(wider_lines)
-                    except Exception:
-                        log.exception("Wider context embedding failed; continuing without")
+                priors_keys = {
+                    p["metadata"].get("source_message_id") or p["id"]
+                    for p in merged_priors
+                }
+                if all_query_embeds:
+                    best_by_id: dict[str, dict] = {}
+                    for emb in all_query_embeds:
+                        try:
+                            hits = self.memory.search(emb, top_k=gm_rcfg["wider_top_k"])
+                        except Exception:
+                            log.exception("Wider search failed for one query; skipping")
+                            continue
+                        for h in hits:
+                            if (not gm_rcfg["include_author_in_wider"]
+                                    and h["metadata"].get("author_id") == target_author_id):
+                                continue
+                            key = h["metadata"].get("source_message_id") or h["id"]
+                            if key in priors_keys:
+                                continue
+                            prev = best_by_id.get(key)
+                            if (prev is None) or (h.get("distance", 1.0) < prev.get("distance", 1.0)):
+                                best_by_id[key] = h
 
-                # Build the user-content block
+                    # Optional action_type boost: extra pass filtered to inferred type
+                    if (gm_rcfg["action_type_boost"] and inferred_action_type
+                            and action_embed):
+                        try:
+                            type_hits = self.memory.search(
+                                action_embed,
+                                top_k=gm_rcfg["wider_top_k"],
+                                where={"action_type": inferred_action_type},
+                            )
+                            for h in type_hits:
+                                if (not gm_rcfg["include_author_in_wider"]
+                                        and h["metadata"].get("author_id") == target_author_id):
+                                    continue
+                                key = h["metadata"].get("source_message_id") or h["id"]
+                                if key in priors_keys:
+                                    continue
+                                prev = best_by_id.get(key)
+                                if (prev is None) or (h.get("distance", 1.0) < prev.get("distance", 1.0)):
+                                    best_by_id[key] = h
+                        except Exception:
+                            log.exception("Action-type-boost search failed; continuing")
+
+                    wider_hits = sorted(
+                        best_by_id.values(), key=lambda h: h.get("distance", 1.0),
+                    )
+                    print(f"{_C_RECV}[GM EMB   ←] wider hits={len(wider_hits)} "
+                          f"(top_k={gm_rcfg['wider_top_k']}, queries={len(all_query_embeds)}, "
+                          f"type_boost={inferred_action_type or '-'}){_C_RST}", flush=True)
+
+                    if wider_hits:
+                        wider_lines = []
+                        remaining_wider_chars = _GM_WIDER_CONTEXT_CHARS
+                        for h in wider_hits:
+                            meta = h["metadata"]
+                            full = meta.get("full_message_text", "") or meta.get("original_excerpt", "")
+                            full = _trim_context_text(
+                                full, min(_GM_CONTEXT_ITEM_CHARS, remaining_wider_chars),
+                            )
+                            remaining_wider_chars = max(0, remaining_wider_chars - len(full))
+                            wider_lines.append(
+                                f"[{str(meta.get('timestamp', ''))[:10]}, "
+                                f"by {meta.get('author_name', '?')}, "
+                                f"#{meta.get('channel', '?')}]\n"
+                                f"Summary: {h['text']}\n"
+                                f"Full post/document excerpt: {full}"
+                            )
+                            if remaining_wider_chars <= 0:
+                                wider_lines.append("[Additional wider-context hits omitted to keep GM context within budget.]")
+                                break
+                        wider_block = "\n\n".join(wider_lines)
+
+                # --- Build the user-content block ---
                 gm_char = target_msg.author.display_name
                 gm_acct = target_msg.author.name
                 gm_author_line = (
@@ -1134,16 +1378,20 @@ class LoreBot(commands.Bot):
                     if len(chain_msgs) > 1 else ""
                 )
                 user_content_parts = [
+                    f"=== RULING ID ===",
+                    f"Use this EXACT id in your ruling header: {ruling_id}",
+                    f"In-game year: {self.state.current_year}",
+                    f"",
                     f"=== ACTION TO ADJUDICATE ===",
                     gm_author_line,
-                    f"Posted: {target_msg.created_at.isoformat()}",
+                    f"Posted: {action_iso}",
                     f"Channel: #{target_msg.channel.name}",
                     f"Message link: {target_msg.jump_url}",
                     f"",
                     f"--- Action text{chain_note} ---",
                     action_text,
                     f"",
-                    f"=== AUTHOR'S PRIOR POSTS (most recent first) ===",
+                    f"=== AUTHOR'S PRIOR POSTS (recency + semantic matches, newest first) ===",
                     priors_block,
                 ]
                 if wider_block:
@@ -1203,7 +1451,6 @@ class LoreBot(commands.Bot):
                     msgs, **_gms
                 )
                 self.state.add_usage("gm", usage)
-                is_replacement = bool(revision_request) or is_reroll
                 if not is_replacement:
                     self.state.bump("gm_rulings_made")
 
@@ -1264,7 +1511,7 @@ class LoreBot(commands.Bot):
                 body_msg_ids: List[str] = []  # ruling text messages (excludes header)
                 if in_dedicated:
                     header = (
-                        f"**GM Ruling{ruling_label}**"
+                        f"**{ruling_id}{ruling_label}**"
                         f" — {target_msg.jump_url}\n"
                         f"Action by **{target_msg.author.display_name}** · "
                         f"Adjudicated by {invocation.author.mention}"
@@ -1344,6 +1591,7 @@ class LoreBot(commands.Bot):
                             "timestamp": invocation.created_at.isoformat(),
                             "year": int(self.state.current_year),
                             "entry_type": entry_type,
+                            "ruling_id": ruling_id or "",
                             "ruled_on_message_id": str(target_msg.id),
                             "ruled_on_author_id": str(target_msg.author.id),
                             "ruled_on_author_name": target_msg.author.display_name,
@@ -1541,17 +1789,17 @@ class LoreBot(commands.Bot):
         print(f"{_C_DIM}            {archivist_input[:500].replace(chr(10), '↵')}{_C_RST}", flush=True)
 
         self.state.bump("messages_sent_to_archivist")
-        summary, chat_usage = await self.llm.chat(
+        raw_archivist, chat_usage = await self.llm.chat(
             self.prompts.get("memory_extraction"), archivist_input,
             **self._mode_settings("archivist"),
         )
         self.state.add_usage("archivist", chat_usage)
         print(f"{_C_RECV}[ARCHIVST←] tokens=p{chat_usage['prompt_tokens']}/c{chat_usage['completion_tokens']}{_C_RST}", flush=True)
-        print(f"{_C_DIM}            {summary}{_C_RST}", flush=True)
+        print(f"{_C_DIM}            {raw_archivist}{_C_RST}", flush=True)
 
         if (
             self.cfg["memory"].get("filter_non_lore", True)
-            and summary.strip().upper().startswith("NO_LORE")
+            and raw_archivist.strip().upper().startswith("NO_LORE")
         ):
             self.state.bump("messages_filtered_non_lore")
             self.flog.log_non_lore(
@@ -1561,6 +1809,12 @@ class LoreBot(commands.Bot):
             print(f"{_C_DIM}[EMBED]     skipped — NO_LORE filter{_C_RST}", flush=True)
             print(f"{_C_HDR}{'─'*70}{_C_RST}", flush=True)
             return False
+
+        summary, tags = _parse_archivist_output(raw_archivist)
+        if tags.get("action_type") or tags.get("entities") or tags.get("claims"):
+            print(f"{_C_DIM}            tags: type={tags.get('action_type', '')!r} "
+                  f"entities={tags.get('entities', '')[:80]!r} "
+                  f"claims={tags.get('claims', '')[:80]!r}{_C_RST}", flush=True)
 
         print(f"{_C_SEND}[EMBED    →] model={self.llm.embedding_model}  text={len(summary)} chars{_C_RST}", flush=True)
         embedding, embed_usage = await self.llm.embed(summary)
@@ -1586,6 +1840,9 @@ class LoreBot(commands.Bot):
                 "has_image": bool(message.attachments),
                 "full_message_text": full_text,
                 "original_excerpt": message.content[:500],
+                "entities": tags.get("entities", ""),
+                "action_type": tags.get("action_type", ""),
+                "claims": tags.get("claims", ""),
             },
         )
         if doc_parts:
@@ -1711,17 +1968,17 @@ class LoreBot(commands.Bot):
               f"  thinking={_fmt_think(_arch['thinking_budget'])}  input={len(archivist_input)} chars{_C_RST}", flush=True)
 
         self.state.bump("messages_sent_to_archivist")
-        summary, chat_usage = await self.llm.chat(
+        raw_archivist, chat_usage = await self.llm.chat(
             self.prompts.get("memory_extraction"), archivist_input,
             **self._mode_settings("archivist"),
         )
         self.state.add_usage("archivist", chat_usage)
         print(f"{_C_RECV}[ARCHIVST←] tokens=p{chat_usage['prompt_tokens']}/c{chat_usage['completion_tokens']}{_C_RST}", flush=True)
-        print(f"{_C_DIM}            {summary}{_C_RST}", flush=True)
+        print(f"{_C_DIM}            {raw_archivist}{_C_RST}", flush=True)
 
         if (
             self.cfg["memory"].get("filter_non_lore", True)
-            and summary.strip().upper().startswith("NO_LORE")
+            and raw_archivist.strip().upper().startswith("NO_LORE")
         ):
             self.state.bump("messages_filtered_non_lore")
             self.flog.log_non_lore(
@@ -1731,6 +1988,12 @@ class LoreBot(commands.Bot):
             print(f"{_C_DIM}[EMBED]     skipped — NO_LORE filter{_C_RST}", flush=True)
             print(f"{_C_HDR}{'─'*70}{_C_RST}", flush=True)
             return False
+
+        summary, tags = _parse_archivist_output(raw_archivist)
+        if tags.get("action_type") or tags.get("entities") or tags.get("claims"):
+            print(f"{_C_DIM}            tags: type={tags.get('action_type', '')!r} "
+                  f"entities={tags.get('entities', '')[:80]!r} "
+                  f"claims={tags.get('claims', '')[:80]!r}{_C_RST}", flush=True)
 
         print(f"{_C_SEND}[EMBED    →] model={self.llm.embedding_model}  text={len(summary)} chars{_C_RST}", flush=True)
         embedding, embed_usage = await self.llm.embed(summary)
@@ -1756,6 +2019,9 @@ class LoreBot(commands.Bot):
                 "has_image": bool(all_images),
                 "full_message_text": full_text,
                 "original_excerpt": combined_content[:500],
+                "entities": tags.get("entities", ""),
+                "action_type": tags.get("action_type", ""),
+                "claims": tags.get("claims", ""),
             },
         )
         if doc_parts:

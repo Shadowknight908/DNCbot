@@ -164,3 +164,12 @@ class StateStore:
             fresh["stats_reset_at"] = _now_iso()
             self._data["stats"] = fresh
             self._save()
+
+    def next_ruling_id(self, year: int) -> int:
+        """Increment and return the per-year GM ruling counter."""
+        with self._lock:
+            key = f"gm_ruling_counter_{int(year)}"
+            n = int(self._data.get(key, 0)) + 1
+            self._data[key] = n
+            self._save()
+            return n
