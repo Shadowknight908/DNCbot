@@ -14,6 +14,7 @@ writeup.md
 # Generated province cache (rebuilt from World_Administrative_Divisions.geojson on first run)
 map_data/arcgis_provinces_merged.geojson
 province_ownership.json
+World_Administrative_Divisions.geojson
 
 # Python
 __pycache__/
@@ -33,4 +34,5 @@ build/
 .idea/
 .vscode/
 *.swp
+World_Administrative_Divisions.geojson
 World_Administrative_Divisions.geojson
