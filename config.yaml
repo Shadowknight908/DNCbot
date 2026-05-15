@@ -78,6 +78,28 @@ gm:
     - "🎲gm-requests🎲"
   # Channel where GM rulings are posted. If empty, bot replies in the invoking channel.
   output_channel: "🎰gm-answers🎰"
+  # Retrieval tuning. All values are read at call time with the defaults shown.
+  retrieval:
+    # How many of the author's most recent prior posts to pull chronologically.
+    author_recency_top_n: 30
+    # How many additional prior posts to pull by semantic similarity to the
+    # action (filtered to the same author, deduped against recency results).
+    author_semantic_top_k: 15
+    # How many wider-archive hits to pull by semantic similarity.
+    wider_top_k: 15
+    # If true, the author's own posts are eligible for the wider pass too
+    # (and then deduped against the priors block). Previously hardcoded false.
+    include_author_in_wider: true
+    # If true, before embedding the action text we ask a small model to
+    # generate 2-4 additional search queries (entities, prerequisites) to
+    # broaden recall. Disable if latency/cost is a concern.
+    expand_queries: true
+    expansion_model: "mistralai/ministral-14b-2512"
+    expansion_max_queries: 4
+    # If true and the expansion call inferred an action_type, run one extra
+    # wider-search pass filtered to that action_type. Only affects memories
+    # ingested after the Archivist tag-block change shipped.
+    action_type_boost: true
 
 # --- MODEL & PROVIDER SETTINGS ---
 models:
