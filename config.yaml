@@ -203,8 +203,19 @@ spatial_mapping:
   province_ownership_path: "province_ownership.json"
   # Human-editable faction membership file used by !DNC mapfaction.
   factions_path: "factions"
-  # Model for !DNC mapparse LLM analysis. null = use models.defaults.model.
+  # Model for !DNC mapparse and !DNC mapchange. null = use models.defaults.model.
+  # The handler is tool-driven: the model must support OpenAI-style function
+  # calling with multiple sequential tool rounds. Procedural models (Kimi K2,
+  # Nemotron, DeepSeek-V4, Qwen-Coder, GLM-4) all work well; pick by cost.
   map_llm_model: moonshotai/kimi-k2.6
+  # Optional reasoning budget passed through to the map LLM. Same shape as
+  # other modes: an int max_tokens, or a string effort level ("low"/"medium"/
+  # "high"/"none"). Leave null/blank to disable. Tool-using flows benefit from
+  # ~500-2000 reasoning tokens for spatial commands.
+  map_llm_thinking_budget:
+  # Maximum number of sequential tool-call rounds the map LLM is allowed.
+  # 6 covers: lookup → radius → in_country → bordering → apply → cleanup.
+  map_llm_max_tool_depth: 6
   # Ordered hex palette. Colors are assigned to tags in this order as nations
   # are first occupied; released and re-assigned fresh when a tag becomes vacant.
   # Edit this list to customize nation colors.

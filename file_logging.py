@@ -56,6 +56,7 @@ class FileLoggers:
         self.ingestion = _make_rotating_logger("dnc.ingestion", "ingestion", log_dir)
         self.commands = _make_rotating_logger("dnc.commands", "commands", log_dir)
         self.voids = _make_append_logger("dnc.voids", "voids.log", log_dir)
+        self.map_changes = _make_append_logger("dnc.map_changes", "map_changes.log", log_dir)
 
     # Convenience helpers — keeps message format consistent everywhere.
     def log_archived(self, msg_id: str, author: str, channel: str, chars: int, year: int):
@@ -92,3 +93,21 @@ class FileLoggers:
         self.voids.info(
             f"PURGED-EXPIRED memories={count}  (retention window passed)"
         )
+
+    def log_map_change(
+        self, command: str, by: str, action: str, pid: str,
+        *, player_tag: str = "", from_tag: str = "", to_tag: str = "",
+        reason: str = "",
+    ):
+        parts = [
+            f"CMD={command}", f"by={by}", f"action={action}", f"province={pid}",
+        ]
+        if player_tag:
+            parts.append(f"tag={player_tag}")
+        if from_tag:
+            parts.append(f"from={from_tag}")
+        if to_tag:
+            parts.append(f"to={to_tag}")
+        if reason:
+            parts.append(f"reason={reason!r}")
+        self.map_changes.info("  ".join(parts))
