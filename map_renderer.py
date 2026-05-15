@@ -691,14 +691,28 @@ def _render_zoom_sync(
     if target.empty:
         raise ValueError(f"Country '{name}' not found in 1970 map dataset")
 
-    # Geographic bounds in EPSG:4326 (may exceed ±180° for Russia)
+    # Geographic bounds in EPSG:4326
     geo_bounds = target.total_bounds  # (minx, miny, maxx, maxy)
 
-    # Projection center clamped to valid lon/lat — handles antimeridian-spanning
-    # countries (e.g. USSR extends past 180°E) that break raw geographic axes.
-    lon_0 = round((max(-180.0, geo_bounds[0]) + min(180.0, geo_bounds[2])) / 2, 4)
     lat_0 = round((geo_bounds[1] + geo_bounds[3]) / 2, 4)
     lat_0 = max(-89.0, min(89.0, lat_0))  # avoid aeqd singularity at poles
+
+    lon_span = geo_bounds[2] - geo_bounds[0]
+    if lon_span > 340:
+        # Country is split at the antimeridian (e.g. Soviet Union: bounds ≈ −180 to +180).
+        # total_bounds midpoint ≈ 0°E is meaningless; derive centre from polygon-part centroids.
+        parts = target.explode(index_parts=False)
+        part_lons = sorted(float(p.centroid.x) for p in parts.geometry)
+        median_lon = part_lons[len(part_lons) // 2]
+        adj = [
+            x + 360 if x < median_lon - 180 else
+            x - 360 if x > median_lon + 180 else
+            x
+            for x in part_lons
+        ]
+        lon_0 = round(((sum(adj) / len(adj) + 180) % 360) - 180, 4)
+    else:
+        lon_0 = round((geo_bounds[0] + geo_bounds[2]) / 2, 4)
 
     # Local azimuthal equidistant projection centered on the country.
     # Correctly wraps antimeridian-spanning geometries (Russia, etc.).
