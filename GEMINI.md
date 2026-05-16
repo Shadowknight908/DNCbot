@@ -18,7 +18,7 @@ This file provides project-wide instructions and architectural guidance for the 
 ## Key Subsystems
 
 - `bot.py`: Main Discord client and command dispatcher.
-- `deepinfra_client.py`: `OpenRouterClient` for Chat/Vision (OpenRouter) and Embeddings (DeepInfra).
+- `inference_client.py`: `InferenceClient` for Chat/Vision/Embeddings via any OpenAI-compatible API (OpenRouter, DeepInfra, etc.).
 - `memory_store.py`: ChromaDB wrapper for vector operations.
 - `state_store.py`: Atomic JSON state management.
 - `prompt_store.py`: Hot-reloadable prompts.
