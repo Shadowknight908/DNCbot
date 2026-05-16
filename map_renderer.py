@@ -598,6 +598,7 @@ def _add_labels(
 def _render_world_sync(
     occupation: dict[str, OccupiedNation],
     province_ownership: dict,
+    year: int = 1970,
 ) -> bytes:
     world = _world()
     world_proj = world.to_crs(_EQUAL_EARTH_CRS)
@@ -621,7 +622,7 @@ def _render_world_sync(
     _add_labels(ax, world_proj, occupation, fontsize=5)
 
     ax.set_axis_off()
-    ax.set_title("DNC World Map — 1970", pad=8, fontsize=16, fontweight="bold", color="white")
+    ax.set_title(f"DNC World Map — {year}", pad=8, fontsize=16, fontweight="bold", color="white")
 
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
@@ -632,6 +633,7 @@ def _render_world_sync(
 
 def _render_faction_world_sync(
     memberships: dict[str, list[FactionMembership]],
+    year: int = 1970,
 ) -> bytes:
     world = _world()
     world_proj = world.to_crs(_EQUAL_EARTH_CRS)
@@ -680,7 +682,7 @@ def _render_faction_world_sync(
         )
 
     ax.set_axis_off()
-    ax.set_title("DNC Faction Map — 1970", pad=8, fontsize=16, fontweight="bold", color="white")
+    ax.set_title(f"DNC Faction Map — {year}", pad=8, fontsize=16, fontweight="bold", color="white")
 
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
@@ -848,6 +850,7 @@ def _render_zoom_sync(
 async def render_world_map(
     occupation: dict[str, OccupiedNation],
     province_ownership: Optional[dict] = None,
+    year: int = 1970,
     # Legacy kwargs accepted and ignored for backward compatibility
     **_,
 ) -> bytes:
@@ -858,12 +861,14 @@ async def render_world_map(
             _render_world_sync,
             occupation,
             province_ownership or {},
+            year,
         ),
     )
 
 
 async def render_faction_map(
     memberships: dict[str, list[FactionMembership]],
+    year: int = 1970,
     # Legacy kwargs accepted and ignored for forward compatibility
     **_,
 ) -> bytes:
@@ -873,6 +878,7 @@ async def render_faction_map(
         partial(
             _render_faction_world_sync,
             memberships,
+            year,
         ),
     )
 

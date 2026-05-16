@@ -3008,7 +3008,7 @@ class LoreBot(commands.Bot):
 
         async def _render() -> bytes:
             return await map_renderer.render_world_map(
-                occupation, province_ownership=ownership,
+                occupation, province_ownership=ownership, year=self.state.current_year,
             )
 
         png, key, hit = await self.map_cache.get_or_render(
@@ -3092,7 +3092,7 @@ class LoreBot(commands.Bot):
 
         async with message.channel.typing():
             try:
-                img_bytes = await map_renderer.render_faction_map(memberships)
+                img_bytes = await map_renderer.render_faction_map(memberships, year=self.state.current_year)
             except Exception as e:
                 await message.reply(f"Faction map render failed: {e}")
                 return
