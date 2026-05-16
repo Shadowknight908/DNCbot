@@ -32,7 +32,7 @@ Key features (v0.6):
   - Subsystem initialization and lifecycle
 
 **Subsystems**
-- `deepinfra_client.py`: Async HTTP wrapper around OpenRouter's API (chat, vision, embeddings); despite the filename it now wraps `OpenRouterClient`
+- `inference_client.py`: Async HTTP wrapper around any OpenAI-compatible inference API (chat, vision, embeddings); supports OpenRouter, HuggingFace TGI, vLLM, etc.
 - `memory_store.py`: ChromaDB wrapper with vector storage, retrieval, void/unvoid, metadata filtering
 - `state_store.py`: Persistent JSON state (current year, stats, timestamps) with atomic writes via temp-then-rename
 - `prompt_store.py`: Hot-reloadable prompt file loader from config paths
