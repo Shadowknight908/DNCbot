@@ -50,6 +50,7 @@ import map_renderer
 import map_scheduler as map_sched
 from nickname_parser import parse_tag
 from province_store import ProvinceStore
+from map_cache import MapCache
 import map_llm
 
 logging.basicConfig(
@@ -333,6 +334,13 @@ class LoreBot(commands.Bot):
             definitions_path=map_cfg.get("province_data_path", "map_data/provinces.json"),
             ownership_path=map_cfg.get("province_ownership_path", "province_ownership.json"),
         )
+
+        persist_path = (
+            "map_data/last_world_map"
+            if map_cfg.get("cache_persist", True)
+            else None
+        )
+        self.map_cache = MapCache(persist_path=persist_path)
 
         tavily_key = os.environ.get("TAVILY_API_KEY", "")
         tavily_cfg = config.get("tavily", {})
@@ -621,6 +629,8 @@ class LoreBot(commands.Bot):
         if self.cfg.get("spatial_mapping", {}).get("enabled"):
             if not self._map_render_task.is_running():
                 self._map_render_task.start()
+        if self.cfg.get("spatial_mapping", {}).get("prewarm_on_startup", True):
+            asyncio.create_task(self._prewarm_map_cache())
 
     async def on_member_remove(self, member: discord.Member):
         if self.optouts.remove(str(member.id)):
@@ -2976,6 +2986,37 @@ class LoreBot(commands.Bot):
         """Build keyword args for map_renderer calls that include province ownership."""
         return dict(province_ownership=self.province_store.get_ownership())
 
+    async def _prewarm_map_cache(self) -> None:
+        """Render the world map once at startup so the first !DNC map is hot.
+
+        Runs as a background task off on_ready. If the disk-persisted entry's
+        state-key still matches the current state, the cache reuses it
+        without invoking the renderer.
+        """
+        try:
+            for guild in self.guilds:
+                self.map_store.rebuild(map_sched.scan_members(guild.members))
+            _png, key, hit = await self._render_world_via_cache()
+            log.info("Map cache prewarm: %s key=%s", "hit" if hit else "miss", key[:8])
+        except Exception:
+            log.exception("Map cache prewarm failed")
+
+    async def _render_world_via_cache(self) -> tuple[bytes, str, bool]:
+        """Render the world map through the cache. Returns (png, key, was_hit)."""
+        occupation = self.map_store.get_occupation()
+        ownership = self.province_store.get_ownership()
+
+        async def _render() -> bytes:
+            return await map_renderer.render_world_map(
+                occupation, province_ownership=ownership,
+            )
+
+        png, key, hit = await self.map_cache.get_or_render(
+            occupation, ownership, _render,
+        )
+        log.info("Map cache: %s key=%s", "hit" if hit else "miss", key[:8])
+        return png, key, hit
+
     async def _render_and_post_map(
         self, channel: Optional[discord.TextChannel] = None
     ) -> Optional[discord.Message]:
@@ -2983,9 +3024,8 @@ class LoreBot(commands.Bot):
         if target is None:
             log.warning("spatial_mapping: output_channel not found, skipping render")
             return None
-        occupation = self.map_store.get_occupation()
         try:
-            img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+            img_bytes, _key, _hit = await self._render_world_via_cache()
         except Exception as e:
             log.error("Map render failed: %s", e, exc_info=True)
             return None
@@ -2998,12 +3038,14 @@ class LoreBot(commands.Bot):
             return None
 
     async def _cmd_map(self, message: discord.Message) -> None:
+        # Defensive resync — a missed on_member_update would otherwise leave
+        # stale occupation, and the cache key follows whatever state we
+        # actually hold. Rebuild is idempotent when nothing changed.
         for guild in self.guilds:
             self.map_store.rebuild(map_sched.scan_members(guild.members))
-        occupation = self.map_store.get_occupation()
         async with message.channel.typing():
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
             except Exception as e:
                 await message.reply(f"Map render failed: {e}")
                 return
@@ -3103,9 +3145,8 @@ class LoreBot(commands.Bot):
             return
 
         async with message.channel.typing():
-            occupation = self.map_store.get_occupation()
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
             except Exception as e:
                 await message.reply(f"Released {released} province(s) for `{tag}` (render failed: {e}).")
                 return
@@ -3155,9 +3196,8 @@ class LoreBot(commands.Bot):
             return
 
         async with message.channel.typing():
-            occupation = self.map_store.get_occupation()
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
             except Exception as e:
                 await message.reply(f"Assigned `{province_id}` to {display_name} (render failed: {e}).")
                 return
@@ -3181,9 +3221,8 @@ class LoreBot(commands.Bot):
             return
 
         async with message.channel.typing():
-            occupation = self.map_store.get_occupation()
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
             except Exception as e:
                 await message.reply(f"Released `{province_id}` (render failed: {e}).")
                 return
@@ -3337,9 +3376,8 @@ class LoreBot(commands.Bot):
             result_lines.append("Errors: " + "; ".join(errors))
 
         async with message.channel.typing():
-            occupation = self.map_store.get_occupation()
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
                 await confirm_msg.reply(
                     "\n".join(result_lines),
                     file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
@@ -3469,9 +3507,8 @@ class LoreBot(commands.Bot):
             result_lines.append("Errors: " + "; ".join(errors))
 
         async with message.channel.typing():
-            occupation = self.map_store.get_occupation()
             try:
-                img_bytes = await map_renderer.render_world_map(occupation, **self._province_render_args())
+                img_bytes, _key, _hit = await self._render_world_via_cache()
                 await confirm_msg.reply(
                     "\n".join(result_lines),
                     file=discord.File(fp=io.BytesIO(img_bytes), filename="dnc_map.png"),
