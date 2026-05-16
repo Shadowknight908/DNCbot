@@ -281,7 +281,7 @@ for _t, _n in TAG_TO_NAME.items():
 # Historical states map to their closest modern equivalent.
 TAG_TO_ISO2: dict[str, str] = {
     # Major powers
-    "USA": "US", "USSR": "RU", "GBR": "GB", "FRA": "FR", "CHN": "CN",
+    "USA": "US", "USSR": "RU", "RUS": "RU", "GBR": "GB", "FRA": "FR", "CHN": "CN",
     "JPN": "JP", "FRG": "DE", "DEW": "DE", "GDR": "DE", "DDR": "DE",
     "ITA": "IT", "CAN": "CA", "AUS": "AU", "NZL": "NZ",
     # Europe
@@ -308,7 +308,8 @@ TAG_TO_ISO2: dict[str, str] = {
     "MYS": "MY", "SGP": "SG", "IDN": "ID", "PHL": "PH",
     "TWN": "TW", "PRK": "KP", "KPN": "KP", "NKO": "KP",
     "KOR": "KR", "SKO": "KR", "MNG": "MN", "MPR": "MN",
-    "AFG": "AF", "HKG": "HK",
+    "AFG": "AF", "HKG": "HK", "MAC": "MO", "BRN": "BN",
+    "TMP": "TL", "TLS": "TL",
     # Africa
     "ETH": "ET", "ERI": "ER", "SOM": "SO", "KEN": "KE",
     "TZA": "TZ", "UGA": "UG", "RWA": "RW", "BDI": "BI",
@@ -333,7 +334,10 @@ TAG_TO_ISO2: dict[str, str] = {
     "URY": "UY", "ARG": "AR", "CHL": "CL",
     # Oceania
     "PNG": "PG", "SLB": "SB", "FJI": "FJ", "WSM": "WS",
-    "TON": "TO", "VUT": "VU",
+    "TON": "TO", "VUT": "VU", "KIR": "KI", "NRU": "NR",
+    "TUV": "TV", "NCL": "NC",
+    # Africa stragglers (1970-era names with no modern ISO2 in main block)
+    "PGU": "GW",
 }
 
 # Reverse: ISO2 → list of game tags that map to it (for color lookup during render)

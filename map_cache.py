@@ -27,7 +27,7 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 log = logging.getLogger("dnc.map_cache")
 
 # Bump when the renderer's output semantics change — busts old disk caches.
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
