@@ -42,6 +42,30 @@ GEOMETRY_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "provinces_by_owner",
+            "description": (
+                "Return all provinces currently owned by a given game tag, along "
+                "with each province's ISO-2 country code. Use this when you need "
+                "to enumerate what a tag actually holds in the game — for example, "
+                "before releasing non-core territory or dissolving an empire. "
+                "The iso_cc field lets you filter by real-world country boundaries "
+                "(e.g. release everything owned by USSR where iso_cc != 'RU')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "player_tag": {
+                        "type": "string",
+                        "description": "Game tag to query (e.g. 'USSR', 'CHN').",
+                    },
+                },
+                "required": ["player_tag"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "lookup_province",
             "description": (
                 "Resolve a free-text place name to one or more province records. "
@@ -219,13 +243,17 @@ Workflow for every command:
   1. Identify the actors: who is taking territory, who is losing it, and the \
 target region (a country, a directional slice of a country, a radius around a \
 place, an adjacency front, etc.).
-  2. Call `lookup_province` to resolve any named places to province IDs and \
+  2. If the command involves releasing, collapsing, or reducing a tag's \
+holdings, call `provinces_by_owner` first to get every province that tag \
+currently holds, including each province's iso_cc (geographic country code). \
+This is the only reliable way to enumerate non-standard assignments.
+  3. Call `lookup_province` to resolve any named places to province IDs and \
 coordinates. If you get a 'country' meta record back, follow up with \
 `provinces_in_country`.
-  3. Call `provinces_in_radius`, `provinces_in_country`, and/or \
+  4. Call `provinces_in_radius`, `provinces_in_country`, and/or \
 `provinces_bordering` to enumerate every affected province. Combine results \
 across calls when needed.
-  4. Call `apply_changes` ONCE with the full batch of operations.
+  5. Call `apply_changes` ONCE with the full batch of operations.
 
 Rules:
   - Only use province IDs returned by tools. Never invent IDs.
@@ -240,7 +268,14 @@ call provinces_in_country with a region_hint to fill in.
   - If something is ambiguous, do your best interpretation but explain in the \
 reason field of each operation.
 
-Example:
+Example — territory collapse:
+  Command: "The Soviet Union falls; keep only Russian Federation territory."
+  Step 1: provinces_by_owner(player_tag="USSR") → list with iso_cc per province.
+  Step 2: For every province where iso_cc != "RU", add a release operation.
+  Step 3: apply_changes(operations=[{action:"release", province_id:"UA-01", \
+reason:"Soviet collapse — non-Russian territory released"}, ...])
+
+Example — invasion:
   Command: "Northern China is invaded by Russia 450 miles in every direction \
 from Xinjiang."
   Step 1: lookup_province(query="Xinjiang") → CN-65 centred at ~(85.3, 41.1).
@@ -261,10 +296,13 @@ affected regions. Do not guess province IDs from training data.
 Workflow:
   1. Read the post. Identify each territorial change: who took what, from whom, \
 and where.
-  2. Resolve named places with `lookup_province`. Use `provinces_in_radius`, \
+  2. If the change involves releasing or reducing a tag's territory, call \
+`provinces_by_owner` to get every province that tag currently holds (with \
+iso_cc), then filter as appropriate.
+  3. Resolve named places with `lookup_province`. Use `provinces_in_radius`, \
 `provinces_in_country`, or `provinces_bordering` to enumerate the affected \
 provinces.
-  3. Call `apply_changes` ONCE with all proposed operations.
+  4. Call `apply_changes` ONCE with all proposed operations.
 
 Rules:
   - If the post does NOT describe any territorial changes, do not call \
@@ -281,10 +319,11 @@ do NOT propose changes — only confirmed/executed actions.
 class _ToolBackend:
     """Holds proposal accumulator + dispatch logic across geometry tools."""
 
-    def __init__(self, tavily: Any = None):
+    def __init__(self, tavily: Any = None, province_context: dict | None = None):
         self.proposals: list[dict] = []
         self.tavily = tavily
         self.calls_made: list[str] = []
+        self.province_context: dict = province_context or {}
 
     def _record_operation(self, op: dict) -> dict:
         """Normalise an LLM-emitted operation to the internal proposal shape."""
@@ -324,6 +363,24 @@ class _ToolBackend:
     async def execute(self, name: str, args: dict) -> str:
         self.calls_made.append(name)
         try:
+            if name == "provinces_by_owner":
+                tag = (args.get("player_tag") or "").strip().upper()
+                if not tag:
+                    return json.dumps({"error": "player_tag is required"})
+                import arcgis_provinces as _ap
+                all_provinces = _ap.get_all()
+                result = []
+                for pid, info in self.province_context.items():
+                    if (info.get("owner") or "").upper() != tag:
+                        continue
+                    prov = all_provinces.get(pid)
+                    result.append({
+                        "province_id": pid,
+                        "display_name": info.get("display_name", pid),
+                        "iso_cc": prov.iso_cc if prov else None,
+                    })
+                return json.dumps({"count": len(result), "provinces": result})
+
             if name == "lookup_province":
                 res = map_geometry.lookup_province(
                     args.get("query", ""),
@@ -415,8 +472,9 @@ async def _run_tool_session(
     tavily: Any,
     thinking_budget: Any,
     max_tool_depth: int,
+    province_context: dict | None = None,
 ) -> _ToolBackend:
-    backend = _ToolBackend(tavily=tavily)
+    backend = _ToolBackend(tavily=tavily, province_context=province_context)
     tools = list(GEOMETRY_TOOLS) + [APPLY_TOOL]
     if tavily is not None:
         tools.append(tavily.tool_definition())
@@ -462,7 +520,7 @@ async def process_map_instructions(
     )
     backend = await _run_tool_session(
         _INSTRUCTION_SYSTEM_PROMPT, user_blob, client, model, tavily,
-        thinking_budget, max_tool_depth,
+        thinking_budget, max_tool_depth, province_context=province_context,
     )
     log.info("mapchange LLM tool calls: %s", backend.calls_made)
     return backend.proposals
@@ -486,7 +544,7 @@ async def parse_post_for_changes(
     )
     backend = await _run_tool_session(
         _POST_PARSE_SYSTEM_PROMPT, user_blob, client, model, tavily,
-        thinking_budget, max_tool_depth,
+        thinking_budget, max_tool_depth, province_context=province_context,
     )
     log.info("mapparse LLM tool calls: %s", backend.calls_made)
     return backend.proposals
