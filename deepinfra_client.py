@@ -103,6 +103,7 @@ class OpenRouterClient:
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_executor: Optional[Callable] = None,
         _tool_depth: int = 0,
+        max_tool_depth: int = 3,
     ) -> Tuple[str, Dict[str, int]]:
         """Multi-turn chat using SSE streaming.
 
@@ -112,7 +113,7 @@ class OpenRouterClient:
         console after the stream ends (covers models that embed tags in content).
 
         If tools and tool_executor are provided, the model may call tools. Results
-        are fed back automatically (up to 3 rounds) before the final reply.
+        are fed back automatically (up to max_tool_depth rounds) before the final reply.
         """
         payload: Dict[str, Any] = {
             "model": model or self.chat_model,
@@ -138,7 +139,7 @@ class OpenRouterClient:
                 # OpenRouter requires top-level max_tokens > reasoning max_tokens
                 if "max_tokens" not in payload:
                     payload["max_tokens"] = thinking_budget + 4096
-        if tools and _tool_depth < 3:
+        if tools and _tool_depth < max_tool_depth:
             payload["tools"] = tools
 
         content_parts: List[str] = []
@@ -218,7 +219,7 @@ class OpenRouterClient:
         first_usage = self._extract_usage({"usage": usage_data})
 
         # If the model made tool calls, execute them and loop
-        if tool_calls_acc and tool_executor is not None and _tool_depth < 3:
+        if tool_calls_acc and tool_executor is not None and _tool_depth < max_tool_depth:
             calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             tool_call_objs = [
                 {
@@ -256,6 +257,7 @@ class OpenRouterClient:
                 thinking_budget=thinking_budget,
                 tools=tools, tool_executor=tool_executor,
                 _tool_depth=_tool_depth + 1,
+                max_tool_depth=max_tool_depth,
             )
             merged = {
                 "prompt_tokens":     first_usage["prompt_tokens"] + cont_usage["prompt_tokens"],

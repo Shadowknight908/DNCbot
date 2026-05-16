@@ -491,11 +491,7 @@ async def _run_tool_session(
     }
     if thinking_budget is not None and thinking_budget != "":
         kwargs["thinking_budget"] = thinking_budget
-    # Plumb tool-call recursion ceiling when the client supports it.
-    try:
-        await client.chat_messages(max_tool_depth=max_tool_depth, **kwargs)
-    except TypeError:
-        await client.chat_messages(**kwargs)
+    await client.chat_messages(max_tool_depth=max_tool_depth, **kwargs)
     return backend
 
 
