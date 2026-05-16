@@ -44,12 +44,15 @@ GEOMETRY_TOOLS: list[dict] = [
         "function": {
             "name": "provinces_by_owner",
             "description": (
-                "Return all provinces currently owned by a given game tag, along "
-                "with each province's ISO-2 country code. Use this when you need "
-                "to enumerate what a tag actually holds in the game — for example, "
-                "before releasing non-core territory or dissolving an empire. "
-                "The iso_cc field lets you filter by real-world country boundaries "
-                "(e.g. release everything owned by USSR where iso_cc != 'RU')."
+                "Return every province a tag effectively controls — both "
+                "explicit per-province assignments AND provinces whose iso_cc "
+                "is inherited via country-level occupation (a player whose "
+                "Discord nickname assigns them this tag). Each entry includes "
+                "iso_cc and an `ownership` field: 'explicit' or 'iso_inherited'. "
+                "Use this to enumerate what a tag holds before releasing "
+                "non-core territory or dissolving an empire. The iso_cc field "
+                "lets you filter by real-world country boundaries (e.g. release "
+                "everything owned by USSR where iso_cc != 'RU')."
             ),
             "parameters": {
                 "type": "object",
@@ -237,6 +240,17 @@ You are the map administrator for a 1970s Cold War roleplay game. You receive \
 plain-English commands from a game master describing territorial changes and \
 your job is to translate them into precise province-level operations.
 
+Ownership model (read carefully):
+  * Country-level OCCUPATION (driven by Discord nicknames, listed in the user \
+message) assigns a player tag to a whole iso_cc. Every province with that \
+iso_cc inherits the tag's colour automatically — no per-province entry needed.
+  * Explicit per-province OWNERSHIP overrides the iso inheritance for that \
+single province.
+  * Releasing an explicitly-owned province makes it fall back to the iso \
+inheritance. Releasing an iso-inherited-only province is a no-op (you cannot \
+make a province non-owned while its country tag is still occupied — instead, \
+TRANSFER it to a different tag).
+
 You have geometry tools — USE THEM. Never guess province IDs from training data.
 
 Workflow for every command:
@@ -319,11 +333,20 @@ do NOT propose changes — only confirmed/executed actions.
 class _ToolBackend:
     """Holds proposal accumulator + dispatch logic across geometry tools."""
 
-    def __init__(self, tavily: Any = None, province_context: dict | None = None):
+    def __init__(
+        self,
+        tavily: Any = None,
+        province_context: dict | None = None,
+        occupation_context: dict | None = None,
+    ):
         self.proposals: list[dict] = []
         self.tavily = tavily
         self.calls_made: list[str] = []
         self.province_context: dict = province_context or {}
+        # Country-level occupation (game_tag -> {display_name, color}). Provinces
+        # whose iso_cc maps to one of these tags inherit that tag's color in the
+        # renderer even without an explicit province_ownership entry.
+        self.occupation_context: dict = occupation_context or {}
 
     def _record_operation(self, op: dict) -> dict:
         """Normalise an LLM-emitted operation to the internal proposal shape."""
@@ -368,18 +391,43 @@ class _ToolBackend:
                 if not tag:
                     return json.dumps({"error": "player_tag is required"})
                 import arcgis_provinces as _ap
+                from map_renderer import TAG_TO_ISO2
                 all_provinces = _ap.get_all()
+
+                # Explicit per-province ownership.
+                explicit_pids = {
+                    pid for pid, info in self.province_context.items()
+                    if (info.get("owner") or "").upper() == tag
+                }
+                # Iso-inherited: when the tag holds country-level occupation
+                # (a player nicknamed e.g. "RUS - Junta"), every province whose
+                # iso_cc maps to this tag inherits its color via the renderer.
+                iso_inherited_pids: set[str] = set()
+                iso_cc = TAG_TO_ISO2.get(tag)
+                country_occupied = tag in self.occupation_context
+                if country_occupied and iso_cc:
+                    iso_inherited_pids = {
+                        p.id for p in _ap.get_by_iso2(iso_cc)
+                    } - explicit_pids
+
                 result = []
-                for pid, info in self.province_context.items():
-                    if (info.get("owner") or "").upper() != tag:
-                        continue
+                for pid in sorted(explicit_pids | iso_inherited_pids):
+                    info = self.province_context.get(pid, {})
                     prov = all_provinces.get(pid)
+                    kind = "explicit" if pid in explicit_pids else "iso_inherited"
                     result.append({
                         "province_id": pid,
                         "display_name": info.get("display_name", pid),
                         "iso_cc": prov.iso_cc if prov else None,
+                        "ownership": kind,
                     })
-                return json.dumps({"count": len(result), "provinces": result})
+                return json.dumps({
+                    "count": len(result),
+                    "tag": tag,
+                    "country_occupied": country_occupied,
+                    "iso_cc_for_tag": iso_cc,
+                    "provinces": result,
+                })
 
             if name == "lookup_province":
                 res = map_geometry.lookup_province(
@@ -443,7 +491,7 @@ def _build_tag_directory_blob() -> str:
 def _ownership_summary(province_context: dict) -> str:
     """Optional short summary of currently-owned provinces for the LLM."""
     if not province_context:
-        return "(No provinces are currently owned.)"
+        return "(No provinces have explicit per-province ownership.)"
     by_tag: dict[str, list[str]] = {}
     for pid, info in province_context.items():
         owner = info.get("owner")
@@ -451,14 +499,46 @@ def _ownership_summary(province_context: dict) -> str:
             continue
         by_tag.setdefault(str(owner), []).append(pid)
     if not by_tag:
-        return "(No provinces are currently owned.)"
-    lines = ["Currently owned provinces (by owner):"]
+        return "(No provinces have explicit per-province ownership.)"
+    lines = ["Explicit per-province ownership (by owner tag):"]
     for owner, pids in sorted(by_tag.items()):
         if len(pids) <= 8:
             lines.append(f"  {owner}: {', '.join(sorted(pids))}")
         else:
             shown = ", ".join(sorted(pids)[:8])
             lines.append(f"  {owner}: {shown}, +{len(pids) - 8} more")
+    return "\n".join(lines)
+
+
+def _occupation_summary(occupation_context: dict) -> str:
+    """Country-level occupation: tag → (display, iso_cc, province_count).
+
+    These are the *country occupants* (driven by Discord nicknames). The
+    renderer colours every province whose iso_cc maps to one of these tags
+    with that tag's colour, even with no explicit province_ownership entry.
+    """
+    if not occupation_context:
+        return "(No country-level occupation.)"
+    try:
+        from map_renderer import TAG_TO_ISO2
+        import arcgis_provinces as _ap
+    except Exception:
+        TAG_TO_ISO2 = {}
+        _ap = None  # type: ignore[assignment]
+    lines = [
+        "Country-level occupation (tag → ISO2, inherits all iso_cc provinces):",
+    ]
+    for tag in sorted(occupation_context):
+        info = occupation_context[tag] or {}
+        iso2 = TAG_TO_ISO2.get(tag)
+        display = info.get("display_name") or tag
+        if iso2 and _ap is not None:
+            count = len(_ap.get_by_iso2(iso2))
+            lines.append(f"  {tag} ({display}) → {iso2} [{count} iso-inherited provinces]")
+        elif iso2:
+            lines.append(f"  {tag} ({display}) → {iso2}")
+        else:
+            lines.append(f"  {tag} ({display}) → (no iso_cc mapping — country fill only)")
     return "\n".join(lines)
 
 
@@ -473,8 +553,13 @@ async def _run_tool_session(
     thinking_budget: Any,
     max_tool_depth: int,
     province_context: dict | None = None,
+    occupation_context: dict | None = None,
 ) -> _ToolBackend:
-    backend = _ToolBackend(tavily=tavily, province_context=province_context)
+    backend = _ToolBackend(
+        tavily=tavily,
+        province_context=province_context,
+        occupation_context=occupation_context,
+    )
     tools = list(GEOMETRY_TOOLS) + [APPLY_TOOL]
     if tavily is not None:
         tools.append(tavily.tool_definition())
@@ -503,6 +588,7 @@ async def process_map_instructions(
     tavily: Any = None,
     thinking_budget: Any = None,
     max_tool_depth: int = 6,
+    occupation_context: dict | None = None,
 ) -> list[dict]:
     """LLM executes a direct GM instruction and returns proposed changes.
 
@@ -510,6 +596,7 @@ async def process_map_instructions(
     """
     user_blob = (
         f"{_build_tag_directory_blob()}\n\n"
+        f"{_occupation_summary(occupation_context or {})}\n\n"
         f"{_ownership_summary(province_context)}\n\n"
         f"---\n"
         f"Map change instructions:\n{instructions}"
@@ -517,6 +604,7 @@ async def process_map_instructions(
     backend = await _run_tool_session(
         _INSTRUCTION_SYSTEM_PROMPT, user_blob, client, model, tavily,
         thinking_budget, max_tool_depth, province_context=province_context,
+        occupation_context=occupation_context,
     )
     log.info("mapchange LLM tool calls: %s", backend.calls_made)
     return backend.proposals
@@ -530,10 +618,12 @@ async def parse_post_for_changes(
     tavily: Any = None,
     thinking_budget: Any = None,
     max_tool_depth: int = 6,
+    occupation_context: dict | None = None,
 ) -> list[dict]:
     """LLM reads a roleplay post and returns proposed changes (if any)."""
     user_blob = (
         f"{_build_tag_directory_blob()}\n\n"
+        f"{_occupation_summary(occupation_context or {})}\n\n"
         f"{_ownership_summary(province_context)}\n\n"
         f"---\n"
         f"Roleplay post to analyze:\n{post_text}"
@@ -541,6 +631,7 @@ async def parse_post_for_changes(
     backend = await _run_tool_session(
         _POST_PARSE_SYSTEM_PROMPT, user_blob, client, model, tavily,
         thinking_budget, max_tool_depth, province_context=province_context,
+        occupation_context=occupation_context,
     )
     log.info("mapparse LLM tool calls: %s", backend.calls_made)
     return backend.proposals

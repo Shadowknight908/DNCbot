@@ -3313,6 +3313,10 @@ class LoreBot(commands.Bot):
             pid: {"owner": o.player_tag, "display_name": o.display_name}
             for pid, o in ownership.items()
         }
+        occupation_context = {
+            tag: {"display_name": n.display_name, "color": n.color}
+            for tag, n in self.map_store.get_occupation().items()
+        }
 
         map_cfg = self.cfg.get("spatial_mapping", {})
         model = map_cfg.get("map_llm_model") or None
@@ -3330,6 +3334,7 @@ class LoreBot(commands.Bot):
                     tavily=self.tavily if tavily_enabled else None,
                     thinking_budget=thinking_budget,
                     max_tool_depth=max_tool_depth,
+                    occupation_context=occupation_context,
                 )
             except Exception as e:
                 await message.reply(f"LLM analysis failed: {e}")
@@ -3445,6 +3450,10 @@ class LoreBot(commands.Bot):
             pid: {"owner": o.player_tag, "display_name": o.display_name}
             for pid, o in ownership.items()
         }
+        occupation_context = {
+            tag: {"display_name": n.display_name, "color": n.color}
+            for tag, n in self.map_store.get_occupation().items()
+        }
 
         model = map_cfg.get("map_llm_model") or None
         thinking_budget = map_cfg.get("map_llm_thinking_budget")
@@ -3461,6 +3470,7 @@ class LoreBot(commands.Bot):
                     tavily=self.tavily if tavily_enabled else None,
                     thinking_budget=thinking_budget,
                     max_tool_depth=max_tool_depth,
+                    occupation_context=occupation_context,
                 )
             except Exception as e:
                 await message.reply(f"LLM processing failed: {e}")
