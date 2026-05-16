@@ -197,6 +197,13 @@ spatial_mapping:
   update_interval_hours: 24
   # Degrees of padding added around the target country for !DNC mapzoom.
   zoom_buffer_deg: 5.0
+  # Render the world map once at boot so the first !DNC map is instant. The
+  # render runs as a background task off on_ready; it does not block login.
+  prewarm_on_startup: true
+  # Persist the most recent rendered PNG + a state-key sidecar to disk.
+  # A bot restart on unchanged state then serves the cached PNG without
+  # re-rendering. Files: map_data/last_world_map.png + .json.
+  cache_persist: true
   # Path where auto-generated province definitions are stored.
   province_data_path: "map_data/provinces.json"
   # Path where province ownership state is persisted.
