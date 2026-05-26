@@ -4,10 +4,11 @@
 thread executor — multi-second). The output is fully determined by:
   - occupation:        {tag: OccupiedNation(..., color, ...)}
   - province_ownership:{pid: ProvinceOwnership(..., player_tag, color, ...)}
+  - year:              baked into the map title
 
-Everything else on those records (display_name, user_id, since) does NOT
-affect the rendered pixels. We hash only the render-affecting fields into
-a deterministic state-key; if the state-key matches the cached entry, the
+Other fields on those records (display_name, user_id, since) do NOT affect
+the rendered pixels. We hash only the render-affecting fields into a
+deterministic state-key; if the state-key matches the cached entry, the
 PNG is reused without invoking matplotlib.
 
 A double-checked-lock pattern collapses concurrent misses into a single
@@ -27,7 +28,7 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 log = logging.getLogger("dnc.map_cache")
 
 # Bump when the renderer's output semantics change — busts old disk caches.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def _atomic_write_bytes(path: str, data: bytes) -> None:
@@ -66,9 +67,10 @@ class MapCache:
     # ── State key ────────────────────────────────────────────────────────────
 
     @staticmethod
-    def compute_key(occupation: dict, province_ownership: dict) -> str:
+    def compute_key(occupation: dict, province_ownership: dict, year: int) -> str:
         payload = {
             "v": CACHE_VERSION,
+            "year": year,
             "occ": sorted((tag, getattr(n, "color", "")) for tag, n in occupation.items()),
             "prov": sorted(
                 (pid, getattr(o, "player_tag", ""), getattr(o, "color", ""))
@@ -84,6 +86,7 @@ class MapCache:
         self,
         occupation: dict,
         province_ownership: dict,
+        year: int,
         renderer: Callable[[], Awaitable[bytes]],
     ) -> Tuple[bytes, str, bool]:
         """Return (png, state_key, was_hit).
@@ -92,7 +95,7 @@ class MapCache:
         without invoking `renderer`. Otherwise `renderer` is awaited under
         an asyncio lock (double-checked) and the result is stored.
         """
-        key = self.compute_key(occupation, province_ownership)
+        key = self.compute_key(occupation, province_ownership, year)
 
         # Fast path: lock-free read.
         png = self._png

@@ -3012,7 +3012,7 @@ class LoreBot(commands.Bot):
             )
 
         png, key, hit = await self.map_cache.get_or_render(
-            occupation, ownership, _render,
+            occupation, ownership, self.state.current_year, _render,
         )
         log.info("Map cache: %s key=%s", "hit" if hit else "miss", key[:8])
         return png, key, hit
