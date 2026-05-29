@@ -730,7 +730,7 @@ def _render_world_sync(
 
     # Layer 3: country labels (overlap-free, centroids in projected space)
     label_sink: list[dict] = []
-    _add_labels(ax, world_proj, occupation, fontsize=6, labels=label_sink)
+    _add_labels(ax, world_proj, occupation, fontsize=8, labels=label_sink)
     _place_labels(ax, fig, label_sink)
 
     ax.set_axis_off()
@@ -738,7 +738,7 @@ def _render_world_sync(
     _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
                 pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
@@ -800,7 +800,7 @@ def _render_faction_world_sync(
     _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
                 pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
@@ -946,7 +946,7 @@ def _render_zoom_sync(
     _add_province_layer(
         ax, province_ownership, occupation,
         xlim=xlim, ylim=ylim,
-        fontsize=6, show_labels=True, lon_0=lon_0, labels=label_sink,
+        fontsize=9, show_labels=True, lon_0=lon_0, labels=label_sink,
     )
 
     # Layer 2: highlighted target country — soft glow under a crisp warm outline
@@ -955,7 +955,7 @@ def _render_zoom_sync(
 
     # Layer 3: collect country labels (highest priority), then place everything
     _add_labels(ax, world_shifted, occupation, xlim=xlim, ylim=ylim,
-                fontsize=8, labels=label_sink)
+                fontsize=14, labels=label_sink)
     _place_labels(ax, fig, label_sink)
 
     ax.set_axis_off()
@@ -965,7 +965,7 @@ def _render_zoom_sync(
     _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=170, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
                 pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
