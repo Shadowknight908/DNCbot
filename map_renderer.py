@@ -34,6 +34,7 @@ import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
 from matplotlib.patches import Patch
 import geopandas as gpd
 import pandas as pd
@@ -46,12 +47,111 @@ from map_store import OccupiedNation
 
 log = logging.getLogger("dnc.map_renderer")
 
-UNOCCUPIED_COLOR = "#cccccc"
-_OCEAN_COLOR = "#2a2a2a"
-_BORDER_COLOR = "#ffffff"
-_PROVINCE_BORDER_COLOR = "#888888"
-_HIGHLIGHT_EDGE = "#333333"
+UNOCCUPIED_COLOR = "#c7cdd1"
+_OCEAN_COLOR = "#16242f"          # deep slate-blue water
+_BORDER_COLOR = "#f4f6f7"        # nation outlines
+_PROVINCE_BORDER_COLOR = "#5d6a72"
+_HIGHLIGHT_EDGE = "#ffd166"      # warm highlight for the focused country
+_HIGHLIGHT_GLOW = "#ffd16655"    # translucent glow behind the highlight
+_GRATICULE_COLOR = "#ffffff"     # faint lat/lon grid (drawn at low alpha)
+_LABEL_LIGHT = "#f7f9fa"         # text color over the dark theme
+_LABEL_HALO = "#10191f"          # text outline for legibility
+_TITLE_COLOR = "#ffffff"
 _FACTION_HATCHES = ("////", "\\\\\\\\", "xxxx", "....", "++++", "oooo")
+
+
+def _text_outline(width: float = 2.2):
+    """Path-effect stroke that gives label text a dark halo for legibility."""
+    return [pe.withStroke(linewidth=width, foreground=_LABEL_HALO)]
+
+
+def _place_labels(ax, fig, candidates: list[dict]) -> None:
+    """Greedy, overlap-free label placement.
+
+    `candidates` is a list of dicts with keys:
+        xy (x, y), text, fontsize, weight, color, priority
+    Higher-priority labels are placed first; any later label whose rendered
+    box would collide with one already placed is dropped. This is what keeps
+    dense province labels from turning into an unreadable pile.
+    """
+    if not candidates:
+        return
+    try:
+        renderer = fig.canvas.get_renderer()
+    except AttributeError:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+
+    placed: list = []
+    for cand in sorted(candidates, key=lambda c: -c["priority"]):
+        txt = ax.annotate(
+            cand["text"],
+            xy=cand["xy"],
+            ha="center", va="center",
+            fontsize=cand["fontsize"],
+            color=cand.get("color", _LABEL_LIGHT),
+            fontweight=cand.get("weight", "normal"),
+            zorder=6,
+            path_effects=_text_outline(cand.get("halo", 2.2)),
+        )
+        try:
+            bbox = txt.get_window_extent(renderer)
+        except Exception:
+            continue
+        # Pad so labels keep a little breathing room between them.
+        pad = 2.0
+        bbox = bbox.expanded(1.0 + pad / max(bbox.width, 1.0),
+                             1.0 + pad / max(bbox.height, 1.0))
+        if any(bbox.overlaps(other) for other in placed):
+            txt.remove()
+            continue
+        placed.append(bbox)
+
+
+def _draw_graticule(ax, xlim, ylim) -> None:
+    """Faint lat/lon grid in raw geographic coords (zoom maps only)."""
+    span = max(xlim[1] - xlim[0], ylim[1] - ylim[0])
+    step = next((s for s in (1, 2, 5, 10, 15, 30) if span / s <= 12), 30)
+    x0 = math.floor(xlim[0] / step) * step
+    y0 = math.floor(ylim[0] / step) * step
+    x = x0
+    while x <= xlim[1]:
+        ax.plot([x, x], [ylim[0], ylim[1]], color=_GRATICULE_COLOR,
+                lw=0.4, alpha=0.08, zorder=0.5)
+        x += step
+    y = y0
+    while y <= ylim[1]:
+        ax.plot([xlim[0], xlim[1]], [y, y], color=_GRATICULE_COLOR,
+                lw=0.4, alpha=0.08, zorder=0.5)
+        y += step
+
+
+def _style_title(ax, title: str, subtitle: Optional[str] = None) -> None:
+    """Two-tier title sitting just above the map panel."""
+    ax.set_title("")
+    ax.text(
+        0.5, 1.035, title, transform=ax.transAxes,
+        ha="center", va="bottom", fontsize=21, fontweight="bold",
+        color=_TITLE_COLOR, family="DejaVu Sans",
+        path_effects=_text_outline(2.6),
+    )
+    if subtitle:
+        ax.text(
+            0.5, 1.006, subtitle, transform=ax.transAxes,
+            ha="center", va="bottom", fontsize=11, fontweight="normal",
+            color="#9fb1bd", path_effects=_text_outline(1.6),
+        )
+
+
+def _frame(fig, ax) -> None:
+    """Thin panel border around the map for a finished, framed look."""
+    pos = ax.get_position()
+    rect = plt.Rectangle(
+        (pos.x0, pos.y0), pos.width, pos.height,
+        transform=fig.transFigure, fill=False,
+        edgecolor="#3a4a55", linewidth=1.4, zorder=20,
+    )
+    fig.add_artist(rect)
 
 _EQUAL_EARTH_CRS = "+proj=eqearth +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
 
@@ -467,6 +567,7 @@ def _add_province_layer(
     show_labels: bool = False,
     crs: Optional[str] = None,
     lon_0: Optional[float] = None,
+    labels: Optional[list] = None,
 ) -> None:
     """Draw real ArcGIS province divisions (always visible).
 
@@ -536,17 +637,17 @@ def _add_province_layer(
         ax=ax,
         color=colors,
         edgecolor=_PROVINCE_BORDER_COLOR,
-        linewidth=0.15,
-        alpha=0.9,
+        linewidth=0.25,
+        alpha=0.92,
     )
 
-    if show_labels:
+    if show_labels and labels is not None:
         for _, row in gdf.iterrows():
             pid = row["province_id"]
             own = province_ownership.get(pid)
-            label = row["name"][:14]
+            label = row["name"][:16]
             if own:
-                label += f"\n{own.display_name[:12]}"
+                label += f"\n{own.display_name[:14]}"
             if crs:
                 centroid = row.geometry.centroid
                 cx, cy = centroid.x, centroid.y
@@ -554,13 +655,17 @@ def _add_province_layer(
                 cx, cy = row["__shifted_cx"], row["cy"]
             else:
                 cx, cy = row["cx"], row["cy"]
-            ax.annotate(
-                label,
-                xy=(cx, cy),
-                ha="center", va="center",
-                fontsize=fontsize, color="#111111",
-                bbox=dict(boxstyle="round,pad=0.08", fc="white", alpha=0.4, ec="none"),
-            )
+            # Bigger provinces (and owned ones) win the contest for screen space.
+            area = float(getattr(row.geometry, "area", 0.0))
+            labels.append({
+                "xy": (cx, cy),
+                "text": label,
+                "fontsize": fontsize,
+                "weight": "bold" if own else "normal",
+                "color": _LABEL_LIGHT,
+                "halo": 2.0,
+                "priority": (50.0 if own else 0.0) + area,
+            })
 
 
 def _add_labels(
@@ -570,8 +675,11 @@ def _add_labels(
     xlim: Optional[tuple[float, float]] = None,
     ylim: Optional[tuple[float, float]] = None,
     fontsize: int = 5,
+    labels: Optional[list] = None,
 ) -> None:
-    """Draw country-level labels for occupied nations."""
+    """Collect country-level labels for occupied nations (highest priority)."""
+    if labels is None:
+        return
     for tag, nation in occupation.items():
         name = TAG_TO_NAME.get(tag)
         if name is None:
@@ -586,13 +694,15 @@ def _add_labels(
             continue
         if ylim and not (ylim[0] <= centroid.y <= ylim[1]):
             continue
-        ax.annotate(
-            f"{tag}\n{nation.display_name[:14]}",
-            xy=(centroid.x, centroid.y),
-            ha="center", va="center",
-            fontsize=fontsize, color="#111111", fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.1", fc="white", alpha=0.45, ec="none"),
-        )
+        labels.append({
+            "xy": (centroid.x, centroid.y),
+            "text": f"{tag} · {nation.display_name[:16]}",
+            "fontsize": fontsize,
+            "weight": "bold",
+            "color": _LABEL_LIGHT,
+            "halo": 3.0,
+            "priority": 1_000_000.0,  # always wins over province labels
+        })
 
 
 def _render_world_sync(
@@ -618,14 +728,18 @@ def _render_world_sync(
     # Layer 2: nation borders redrawn on top for clean outlines
     world_proj.plot(ax=ax, color="none", edgecolor=_BORDER_COLOR, linewidth=0.5)
 
-    # Layer 3: country labels (centroids computed in projected space)
-    _add_labels(ax, world_proj, occupation, fontsize=5)
+    # Layer 3: country labels (overlap-free, centroids in projected space)
+    label_sink: list[dict] = []
+    _add_labels(ax, world_proj, occupation, fontsize=8, labels=label_sink)
+    _place_labels(ax, fig, label_sink)
 
     ax.set_axis_off()
-    ax.set_title(f"DNC World Map — {year}", pad=8, fontsize=16, fontweight="bold", color="white")
+    _style_title(ax, "DNC WORLD MAP", str(year))
+    _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -682,10 +796,12 @@ def _render_faction_world_sync(
         )
 
     ax.set_axis_off()
-    ax.set_title(f"DNC Faction Map — {year}", pad=8, fontsize=16, fontweight="bold", color="white")
+    _style_title(ax, "DNC FACTION MAP", str(year))
+    _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
@@ -817,31 +933,40 @@ def _render_zoom_sync(
     ax.set_ylim(*ylim)
     ax.set_aspect(aspect)
 
+    # Faint lat/lon grid for a cartographic feel
+    _draw_graticule(ax, xlim, ylim)
+
     # Layer 0: base nation fills in shifted geographic coords
     world_shifted.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
 
-    # Layer 1: province subdivisions, longitude-shifted to the same window
+    # Layer 1: province subdivisions, longitude-shifted to the same window.
+    # Labels are collected, not drawn yet, so they can be de-conflicted together
+    # with the country labels below.
+    label_sink: list[dict] = []
     _add_province_layer(
         ax, province_ownership, occupation,
         xlim=xlim, ylim=ylim,
-        fontsize=6, show_labels=True, lon_0=lon_0,
+        fontsize=9, show_labels=True, lon_0=lon_0, labels=label_sink,
     )
 
-    # Layer 2: highlighted target country border redrawn on top
-    target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.5)
+    # Layer 2: highlighted target country — soft glow under a crisp warm outline
+    target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_GLOW, linewidth=7.0)
+    target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.4)
 
-    # Layer 3: country labels (centroids of shifted geometries)
-    _add_labels(ax, world_shifted, occupation, xlim=xlim, ylim=ylim, fontsize=7)
+    # Layer 3: collect country labels (highest priority), then place everything
+    _add_labels(ax, world_shifted, occupation, xlim=xlim, ylim=ylim,
+                fontsize=14, labels=label_sink)
+    _place_labels(ax, fig, label_sink)
 
     ax.set_axis_off()
 
-    title = tag
-    if tag in occupation:
-        title += f"  —  {occupation[tag].display_name}"
-    ax.set_title(title, pad=8, fontsize=16, fontweight="bold", color="white")
+    subtitle = occupation[tag].display_name if tag in occupation else "Unclaimed territory"
+    _style_title(ax, tag, subtitle)
+    _frame(fig, ax)
 
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=160, bbox_inches="tight", facecolor=_OCEAN_COLOR)
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                pad_inches=0.25, facecolor=_OCEAN_COLOR)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
