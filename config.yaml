@@ -101,6 +101,31 @@ gm:
     # ingested after the Archivist tag-block change shipped.
     action_type_boost: true
 
+# --- WAR GM MODE ---
+# Wars are fought inside Discord threads. A GM runs `!DNC war start` in a thread
+# to begin, registers sides, then players submit moves with `!DNC war move`.
+# The bot adjudicates each move, remembers the entire war verbatim, and writes a
+# narrative chronicle to the main archive when the war ends.
+war:
+  # Roles allowed to run GM-only war commands (start/side/npc/npcact/end/commit/
+  # cancel) and to revise rulings by replying. Falls back to gm.roles, then admin.
+  roles: []
+  # When a player move directly targets an AI-controlled nation, automatically
+  # generate that nation's response move and adjudicate it.
+  npc_auto_respond: true
+  # Cap on auto-generated NPC responses per player move (bounds cost/loops).
+  npc_max_responses_per_move: 2
+  context:
+    # Character budget for the verbatim war-log replay fed into each ruling. If
+    # the log exceeds this, older entries are dropped in favour of the digest +
+    # most recent entries (the digest preserves their effect).
+    log_char_budget: 120000
+    # How many wider-archive memories to pull as the acting nation's established
+    # lore (capabilities/history) when adjudicating its move.
+    archive_top_k: 12
+    # Per-archive-item char cap for that nation-lore block.
+    archive_item_chars: 4000
+
 # --- MODEL & PROVIDER SETTINGS ---
 models:
   provider:
@@ -147,6 +172,39 @@ models:
       max_tokens:
       thinking_budget: low
     gm:
+      model: z-ai/glm-5.1
+      temperature: 0.7
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 1500
+    # War move adjudication — wants strong reasoning + continuity. Inherits the
+    # gm model by default; override here if you want a different judge for wars.
+    war:
+      model: z-ai/glm-5.1
+      temperature: 0.7
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 1500
+    # Generates an AI nation's war move (in-character declaration, not a ruling).
+    war_npc:
+      model: z-ai/glm-5.1
+      temperature: 0.9
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 800
+    # Maintains the running war state digest. A cheap, fast model is fine.
+    war_digest:
+      model: mistralai/ministral-14b-2512
+      temperature: 0.2
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget:
+    # Writes the final war chronicle(s) into the archive. Wants quality prose.
+    war_chronicle:
       model: z-ai/glm-5.1
       temperature: 0.7
       top_p:
@@ -280,3 +338,7 @@ prompts:
   chat: "prompts/chat.txt"
   chat_unhinged: "prompts/chat_unhinged.txt"
   gm_ruling: "prompts/gm_ruling.txt"
+  war_move_ruling: "prompts/war_move_ruling.txt"
+  war_npc_move: "prompts/war_npc_move.txt"
+  war_state_digest: "prompts/war_state_digest.txt"
+  war_chronicle: "prompts/war_chronicle.txt"
