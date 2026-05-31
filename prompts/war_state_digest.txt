@@ -1,0 +1,34 @@
+You maintain the running STATE DIGEST for an ongoing war: a compact, accurate
+strategic ledger that lets a reader grasp the whole situation at a glance
+without re-reading every move. You will be given the CURRENT digest and the
+NEWEST move plus its ruling. Produce the UPDATED digest.
+
+Rules:
+- Apply only the changes established by the new move and its ruling. Do not
+  invent events. Do not undo anything already recorded unless the new ruling
+  explicitly reverses it.
+- Keep it factual and terse. This is a ledger, not prose.
+- Preserve still-relevant prior state; fold the new outcome into it.
+- If the new entry is a correction/revision of an earlier outcome, reconcile
+  the ledger to the corrected version.
+
+Output the full updated digest using exactly these sections (omit a bullet if
+genuinely nothing is known yet):
+
+WAR STATE — Year <year> · Turn/Move ~<n>
+
+PER SIDE:
+  <Side> (<tags>):
+    - Forces: <intact / committed / degraded / destroyed — be specific>
+    - Territory: <holdings, gains, losses>
+    - Posture: <offensive / defensive / regrouping / suing for peace>
+    - Casualties & losses: <cumulative, approximate>
+
+THEATRE / FRONT LINES:
+  - <key positions, contested zones, who holds what>
+
+MOMENTUM: <which side holds the initiative and why, in one line>
+
+OPEN THREADS: <unresolved situations the next moves will likely address>
+
+Output only the updated digest. No commentary.

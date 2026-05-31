@@ -32,6 +32,10 @@ DEFAULT_STATE: Dict[str, Any] = {
         "chatuc_answered": 0,
         "gm_rulings_made": 0,
         "gm_rulings_revised": 0,
+        "wars_started": 0,
+        "war_moves_adjudicated": 0,
+        "war_npc_moves": 0,
+        "wars_ended": 0,
         "voids_executed": 0,
         "unvoids_executed": 0,
         "archivist_prompt_tokens": 0,
@@ -44,6 +48,8 @@ DEFAULT_STATE: Dict[str, Any] = {
         "chatuc_completion_tokens": 0,
         "gm_prompt_tokens": 0,
         "gm_completion_tokens": 0,
+        "war_prompt_tokens": 0,
+        "war_completion_tokens": 0,
         "vision_prompt_tokens": 0,
         "vision_completion_tokens": 0,
         "embedding_tokens": 0,
@@ -169,6 +175,15 @@ class StateStore:
         """Increment and return the per-year GM ruling counter."""
         with self._lock:
             key = f"gm_ruling_counter_{int(year)}"
+            n = int(self._data.get(key, 0)) + 1
+            self._data[key] = n
+            self._save()
+            return n
+
+    def next_war_id(self, year: int) -> int:
+        """Increment and return the per-year war counter."""
+        with self._lock:
+            key = f"war_counter_{int(year)}"
             n = int(self._data.get(key, 0)) + 1
             self._data[key] = n
             self._save()

@@ -32,6 +32,7 @@ from channel_names import (
     emit_warnings,
 )
 from espionage_store import EspionageStore
+from war_store import WarStore
 from chat_blacklist import ChatBlacklist
 from inference_client import InferenceClient
 from file_logging import FileLoggers
@@ -267,6 +268,14 @@ class LoreBot(commands.Bot):
             if r and isinstance(r, str)
         }
 
+        # War GM mode configuration
+        war_cfg = config.get("war", {})
+        self._war_cfg = war_cfg
+        self._war_roles = {
+            r.strip().lower() for r in war_cfg.get("roles", []) or []
+            if r and isinstance(r, str)
+        }
+
         # Espionage channel sets
         esp_cfg = config.get("espionage", {})
         esp_cmd_raw, _ = sanitize_channel_list(
@@ -293,6 +302,11 @@ class LoreBot(commands.Bot):
         self._ruling_msg_cache: Dict[str, dict] = {}
         self._gm_inflight: set[str] = set()
 
+        # War GM mode: maps war-ruling Discord message IDs → re-adjudication context
+        # (used for 🎲 rerolls and GM revise-by-reply). In-memory, like the GM cache.
+        self._war_ruling_cache: Dict[str, dict] = {}
+        self._war_inflight: set[str] = set()
+
         # Subsystems
         m_cfg = config["models"]
         prov = m_cfg["provider"]
@@ -313,6 +327,7 @@ class LoreBot(commands.Bot):
         self.state = StateStore("state.json")
         self.optouts = OptOutStore("optouts.txt")
         self.espionage = EspionageStore("espionage.json")
+        self.war_store = WarStore("wars.json")
         self.chat_blacklist = ChatBlacklist(
             config.get("chat_blacklist_file", "chat_blacklist.txt")
         )
@@ -425,6 +440,7 @@ class LoreBot(commands.Bot):
             f"`{prefix} <question>` — Query the lore archive",
             f"`{prefix} chat <message>` — Chat with the bot",
             f"`{prefix} gm <message-link>` — GM adjudication (GM/admin only)",
+            f"`{prefix} war help` — War GM mode (run inside a war's thread)",
             f"`{prefix} year` — Show current in-game year",
             f"`{prefix} optout` / `{prefix} optin` — Manage your opt-out",
             f"`{prefix} whoami` — Show your role/permission status",
@@ -483,6 +499,17 @@ class LoreBot(commands.Bot):
             return bool(member_role_names & self._admin_roles)
         member_role_names = {r.name.lower() for r in member.roles}
         return bool(member_role_names & self._gm_roles)
+
+    def _is_war_gm(self, member: discord.abc.User) -> bool:
+        """True if user may run GM-only war commands and revise war rulings.
+
+        Uses war.roles if configured; otherwise falls back to GM/admin checks.
+        """
+        if not isinstance(member, discord.Member):
+            return False
+        if self._war_roles:
+            return bool({r.name.lower() for r in member.roles} & self._war_roles)
+        return self._is_gm_user(member)
 
     def _is_espionage_secret_channel(self, channel) -> bool:
         name = normalize_channel_name(getattr(channel, "name", "") or "")
@@ -660,6 +687,45 @@ class LoreBot(commands.Bot):
             return
 
         msg_id = str(payload.message_id)
+
+        # War ruling reroll: original move submitter or a war GM may reroll.
+        war_cache = self._war_ruling_cache.get(msg_id)
+        if war_cache is not None:
+            war = self.war_store.get_active_war(war_cache["thread_id"])
+            if not war or war.get("status") != "active":
+                return
+            guild = self.get_guild(payload.guild_id)
+            if guild is None:
+                return
+            member = guild.get_member(payload.user_id)
+            allowed = (
+                (war_cache.get("author_id")
+                 and str(payload.user_id) == war_cache["author_id"])
+                or (member is not None and self._is_war_gm(member))
+            )
+            if not allowed:
+                return
+            thread = guild.get_thread(int(war_cache["thread_id"]))
+            if thread is None:
+                try:
+                    thread = await self.fetch_channel(int(war_cache["thread_id"]))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    return
+            await self._produce_war_ruling(
+                thread=thread, tid=war_cache["thread_id"], invocation=None,
+                actor_tag=war_cache["actor_tag"], actor_side=war_cache["actor_side"],
+                is_npc=war_cache["is_npc"], move_text=war_cache["move_text"],
+                source_message_id=war_cache["source_message_id"],
+                author_id=war_cache.get("author_id", ""),
+                author_name=war_cache.get("author_name", ""),
+                allow_npc_response=False, guidance=war_cache.get("guidance"),
+                existing_move_seq=war_cache["move_seq"],
+                old_ruling_seq=war_cache["ruling_seq"],
+                old_ruling_msg_ids=war_cache.get("ruling_msg_ids"),
+                is_reroll=True,
+            )
+            return
+
         cache = self._ruling_msg_cache.get(msg_id)
         if cache is None:
             return
@@ -825,6 +891,11 @@ class LoreBot(commands.Bot):
                 return
 
         # 4. Live ingestion path (non-command messages)
+        # War threads are isolated from the main archive while the war is live;
+        # only the final chronicle (on `war commit`) is written to lore.
+        if (isinstance(message.channel, discord.Thread)
+                and self.war_store.get_active_war(str(message.channel.id))):
+            self.state.bump("messages_filtered_local"); return
         if not self._is_scanned(message.channel):
             self.state.bump("messages_filtered_local"); return
         if len(content) < self._get_min_length(message):
@@ -844,6 +915,29 @@ class LoreBot(commands.Bot):
     # ------------------------------------------------------------------
     async def _handle_reply_to_bot(self, message: discord.Message,
                                     parent: discord.Message):
+        # War ruling revision: a GM replies to a war ruling asking for changes.
+        war_cache = self._war_ruling_cache.get(str(parent.id))
+        if war_cache is not None:
+            if not self._is_war_gm(message.author):
+                return  # silent — only war GMs revise war rulings
+            if not isinstance(message.channel, discord.Thread):
+                return
+            await self._produce_war_ruling(
+                thread=message.channel, tid=war_cache["thread_id"],
+                invocation=message,
+                actor_tag=war_cache["actor_tag"], actor_side=war_cache["actor_side"],
+                is_npc=war_cache["is_npc"], move_text=war_cache["move_text"],
+                source_message_id=war_cache["source_message_id"],
+                author_id=war_cache.get("author_id", ""),
+                author_name=war_cache.get("author_name", ""),
+                allow_npc_response=False, guidance=war_cache.get("guidance"),
+                revision_request=message.content,
+                existing_move_seq=war_cache["move_seq"],
+                old_ruling_seq=war_cache["ruling_seq"],
+                old_ruling_msg_ids=war_cache.get("ruling_msg_ids"),
+            )
+            return
+
         # Walk the reply chain to find the conversation root and the mode.
         chain_back, root = await reply_chain.walk_reply_chain(
             message=message,
@@ -1621,6 +1715,755 @@ class LoreBot(commands.Bot):
             await invocation.reply(f"⚠️ GM ruling failed: `{e}`")
         finally:
             self._gm_inflight.discard(gm_key)
+
+    # ------------------------------------------------------------------
+    # War GM mode
+    # ------------------------------------------------------------------
+    def _war_help_text(self) -> str:
+        p = self.prefix
+        return "\n".join([
+            "⚔️ **War GM mode** — run these inside the war's thread:",
+            f"`{p} war start <title>` — begin a war in this thread *(GM)*",
+            f"`{p} war side <Side> <TAG|@player> …` — register a side *(GM)*",
+            f"`{p} war npc <TAG> [on|off]` — toggle AI control of a nation *(GM)*",
+            f"`{p} war move <text|message-link>` — submit & adjudicate a move *(belligerents)*",
+            f"`{p} war npcact <TAG> [guidance]` — make an AI nation act now *(GM)*",
+            f"`{p} war status` — show sides + the current war-state digest",
+            f"`{p} war end` — draft the war chronicle *(GM)*",
+            f"`{p} war commit` — write the chronicle to the archive *(GM)*",
+            f"`{p} war cancel` — abandon the war, write nothing *(GM)*",
+            "Reply to a ruling to revise it *(GM)*, or 🎲-react it to reroll.",
+        ])
+
+    def _war_briefing(self, war: dict) -> str:
+        """Compact human-readable briefing of the war's sides and belligerents."""
+        lines = [
+            f"War ID: {war['war_id']}",
+            f"Title: {war.get('title', '')}",
+            f"Current in-game year: {self.state.current_year} "
+            f"(war began {war.get('start_year')})",
+            "Sides & belligerents:",
+        ]
+        sides = war.get("sides", {})
+        bel = war.get("belligerents", {})
+        if sides:
+            for side_name, side in sides.items():
+                tag_strs = []
+                for tag in side.get("tags", []):
+                    npc = bel.get(tag, {}).get("npc", False)
+                    tag_strs.append(f"{tag}{' [AI]' if npc else ''}")
+                lines.append(f"  • {side_name}: {', '.join(tag_strs) or '(none)'}")
+        else:
+            lines.append("  (no sides registered yet)")
+        return "\n".join(lines)
+
+    def _render_war_log(self, war: dict, budget: int) -> str:
+        """Render the verbatim war log (skipping superseded rulings), oldest→newest.
+
+        If the rendered text exceeds `budget` chars, the oldest blocks are
+        dropped (their effects survive in the maintained state digest).
+        """
+        blocks: list[str] = []
+        for e in war.get("log", []):
+            if e.get("superseded"):
+                continue
+            t = e.get("type")
+            ts = str(e.get("timestamp", ""))[:19]
+            if t in ("move", "npc_move"):
+                who = e.get("tag", "?")
+                side = e.get("side", "")
+                actor = e.get("author_name") or who
+                kind = "AI MOVE" if t == "npc_move" else "MOVE"
+                head = (f"[{kind} #{e.get('seq')}] {who}"
+                        f"{f' ({side})' if side else ''} — by {actor} @ {ts}")
+                blocks.append(f"{head}\n{e.get('text', '')}")
+            elif t == "ruling":
+                blocks.append(
+                    f"[RULING on move #{e.get('of_seq', '?')}]\n{e.get('text', '')}"
+                )
+        if not blocks:
+            return "(No moves recorded yet — this is the opening move of the war.)"
+        text = "\n\n".join(blocks)
+        if len(text) <= budget:
+            return text
+        kept: list[str] = []
+        total = 0
+        for b in reversed(blocks):
+            if kept and total + len(b) > budget:
+                break
+            kept.append(b)
+            total += len(b)
+        kept.reverse()
+        note = ("[... earlier moves omitted from verbatim replay; their effects "
+                "are captured in the STATE DIGEST above ...]")
+        return note + "\n\n" + "\n\n".join(kept)
+
+    async def _pull_nation_lore(self, tag: str, hint_text: str,
+                                top_k: int, item_chars: int) -> str:
+        """Pull a nation's established lore from the main archive for grounding."""
+        query = (f"{tag} nation military forces capabilities army navy doctrine "
+                 f"history leadership. {hint_text}")
+        try:
+            q_embed, usage = await self.llm.embed(
+                _trim_context_text(query, _EMBED_INPUT_CHARS)
+            )
+            self.state.add_usage("embedding", usage)
+            hits = self.memory.search(q_embed, top_k=top_k)
+        except Exception:
+            log.exception("War nation-lore retrieval failed for %s", tag)
+            return ""
+        if not hits:
+            return ""
+        lines = []
+        for h in hits:
+            meta = h["metadata"]
+            full = meta.get("full_message_text", "") or meta.get("original_excerpt", "")
+            full = _trim_context_text(full, item_chars)
+            lines.append(
+                f"[{str(meta.get('timestamp', ''))[:10]}, "
+                f"by {meta.get('author_name', '?')}, #{meta.get('channel', '?')}, "
+                f"year {meta.get('year', '?')}]\n"
+                f"Summary: {h['text']}\n"
+                f"Full: {full}"
+            )
+        return "\n\n".join(lines)
+
+    # ---- Command dispatcher -----------------------------------------
+    async def _cmd_war(self, message: discord.Message, arg: str):
+        if not isinstance(message.channel, discord.Thread):
+            await message.reply(
+                f"⚔️ War mode runs inside a thread. Open a thread for the war, then "
+                f"run `{self.prefix} war start <title>` there. (`{self.prefix} war help` "
+                f"for the full command list.)"
+            )
+            return
+
+        parts = arg.strip().split(maxsplit=1)
+        sub = parts[0].lower() if parts and parts[0] else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        thread = message.channel
+        tid = str(thread.id)
+
+        if sub in ("", "help"):
+            await message.reply(self._war_help_text()); return
+        if sub == "start":
+            await self._war_start(message, thread, tid, rest); return
+        if sub == "status":
+            await self._war_status(message, tid); return
+        if sub == "move":
+            await self._war_move(message, thread, tid, rest); return
+
+        # Everything below is GM-only.
+        if not self._is_war_gm(message.author):
+            await message.reply("⚠️ Only a war GM can use that war command.")
+            return
+        if sub == "side":
+            await self._war_side(message, thread, tid, rest)
+        elif sub == "npc":
+            await self._war_npc_toggle(message, tid, rest)
+        elif sub == "npcact":
+            await self._war_npcact(message, thread, tid, rest)
+        elif sub == "end":
+            await self._war_end(message, thread, tid)
+        elif sub == "commit":
+            await self._war_commit(message, thread, tid)
+        elif sub == "cancel":
+            await self._war_cancel(message, tid)
+        else:
+            await message.reply(
+                f"Unknown war subcommand `{sub}`. Try `{self.prefix} war help`."
+            )
+
+    async def _war_start(self, message, thread, tid, title):
+        if not self._is_war_gm(message.author):
+            await message.reply("⚠️ Only a war GM can start a war."); return
+        existing = self.war_store.get_active_war(tid)
+        if existing:
+            await message.reply(
+                f"⚠️ A war is already live in this thread: **{existing['war_id']}** "
+                f"({existing.get('title', '')}). End or cancel it first."
+            )
+            return
+        year = self.state.current_year
+        seq = self.state.next_war_id(year)
+        war_id = f"WAR-{year}-{seq:04d}"
+        title = (title or "").strip() or thread.name or war_id
+        self.war_store.create_war(
+            tid, war_id, title, str(message.guild.id), str(message.author.id), year
+        )
+        self.state.bump("wars_started")
+        self.flog.log_command("war start", str(message.author), thread.name,
+                              f"{war_id} {title}")
+        await message.reply(
+            f"⚔️ **{war_id}** — *{title}* — is now active in this thread, with "
+            f"{message.author.mention} as GM.\n\n"
+            f"**Next:** register the sides, e.g.\n"
+            f"`{self.prefix} war side Allies USA GBR`\n"
+            f"`{self.prefix} war side Coalition @player SYR`\n\n"
+            f"Unoccupied nations are auto-flagged AI-controlled (toggle with "
+            f"`{self.prefix} war npc <TAG> on|off`). Then players submit moves with "
+            f"`{self.prefix} war move <description or message-link>`."
+        )
+
+    async def _war_side(self, message, thread, tid, rest):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply(
+                f"⚠️ No active war here. Run `{self.prefix} war start` first."); return
+        bits = rest.split()
+        if len(bits) < 2:
+            await message.reply(
+                f"Usage: `{self.prefix} war side <SideName> <TAG|@player> [more…]`\n"
+                f"Example: `{self.prefix} war side Allies USA GBR @player`"
+            )
+            return
+        side_name = bits[0]
+        occupation = self.map_store.get_occupation()
+        belligerents: list[tuple[str, bool]] = []
+        notes: list[str] = []
+        for tok in bits[1:]:
+            m = MENTION_RE.match(tok)
+            if m:
+                member = message.guild.get_member(int(m.group(1)))
+                tag = parse_tag(member.display_name) if member else None
+                if not tag:
+                    notes.append(f"⚠️ couldn't read a nation TAG from {tok}")
+                    continue
+                belligerents.append((tag, False))  # mentioned member = human-controlled
+            else:
+                tag = tok.upper().strip(",")
+                if not re.match(r"^[A-Z]{2,4}$", tag):
+                    notes.append(f"⚠️ `{tok}` is not a TAG or @mention")
+                    continue
+                npc = tag not in occupation  # auto-flag unoccupied nations as AI
+                belligerents.append((tag, npc))
+        if not belligerents:
+            await message.reply("⚠️ No valid belligerents parsed.\n" + "\n".join(notes))
+            return
+        self.war_store.add_side(tid, side_name, belligerents)
+        desc = ", ".join(f"{t}{' [AI]' if npc else ''}" for t, npc in belligerents)
+        suffix = ("\n" + "\n".join(notes)) if notes else ""
+        await message.reply(
+            f"✅ Side **{side_name}**: {desc}{suffix}\n"
+            f"(Toggle AI control with `{self.prefix} war npc <TAG> on|off`.)"
+        )
+
+    async def _war_npc_toggle(self, message, tid, rest):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply("⚠️ No active war here."); return
+        bits = rest.split()
+        bel = war.get("belligerents", {})
+        if not bits:
+            if not bel:
+                await message.reply("No belligerents registered yet."); return
+            lines = ["**Belligerents:**"]
+            for tag, info in bel.items():
+                lines.append(
+                    f"• `{tag}` — {info.get('side', '?')} — "
+                    f"{'🤖 AI-controlled' if info.get('npc') else '🧑 player-controlled'}"
+                )
+            await message.reply("\n".join(lines)); return
+        tag = bits[0].upper()
+        if tag not in bel:
+            await message.reply(f"⚠️ `{tag}` is not a belligerent in this war."); return
+        if len(bits) >= 2:
+            val = bits[1].lower() in ("on", "true", "yes", "1", "ai")
+        else:
+            val = not bel[tag].get("npc", False)
+        self.war_store.set_npc(tid, tag, val)
+        await message.reply(
+            f"✅ `{tag}` is now {'🤖 AI-controlled' if val else '🧑 player-controlled'}."
+        )
+
+    async def _war_status(self, message, tid):
+        war = self.war_store.get_war(tid)
+        if not war:
+            await message.reply("No war has been started in this thread."); return
+        digest = war.get("state_digest") or "(no moves adjudicated yet)"
+        body = (
+            f"⚔️ **{war['war_id']}** — *{war.get('title', '')}* — status: "
+            f"**{war.get('status')}**\n"
+            f"{self._war_briefing(war)}\n\n"
+            f"**State digest:**\n{digest}"
+        )
+        await self._send_chunked_reply(message, body)
+
+    async def _resolve_war_move_text(self, message, rest):
+        """Resolve move text from inline text, a message link, or a reply."""
+        rest = (rest or "").strip()
+        link = MSG_LINK_RE.search(rest)
+        if link:
+            try:
+                ch = self.get_channel(int(link.group(2)))
+                if ch is None:
+                    ch = await self.fetch_channel(int(link.group(2)))
+                tmsg = await ch.fetch_message(int(link.group(3)))
+                return (await self._message_text_with_documents(tmsg)).strip(), tmsg
+            except Exception:
+                return "", None
+        if rest:
+            return rest, None
+        if message.reference and message.reference.message_id:
+            try:
+                tmsg = await message.channel.fetch_message(message.reference.message_id)
+                return (await self._message_text_with_documents(tmsg)).strip(), tmsg
+            except Exception:
+                return "", None
+        return "", None
+
+    async def _war_move(self, message, thread, tid, rest):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply(
+                f"⚠️ No active war in this thread. A GM must run "
+                f"`{self.prefix} war start` first."); return
+        if war.get("status") == "pending_commit":
+            await message.reply(
+                "⚠️ This war has ended and is awaiting its chronicle commit — "
+                "no further moves."); return
+        move_text, src_msg = await self._resolve_war_move_text(message, rest)
+        if not move_text:
+            await message.reply(
+                f"Usage: `{self.prefix} war move <what your nation does>` — "
+                f"or paste a message link, or reply to a post with "
+                f"`{self.prefix} war move`."); return
+
+        bel = war.get("belligerents", {})
+        actor_tag = parse_tag(message.author.display_name)
+        if actor_tag not in bel:
+            if self._is_war_gm(message.author):
+                await message.reply(
+                    f"⚠️ Your nickname's TAG isn't a registered belligerent. As GM, "
+                    f"use `{self.prefix} war npcact <TAG>` to act for an AI nation, "
+                    f"or register the side with `{self.prefix} war side`."
+                )
+            else:
+                await message.reply(
+                    "⚠️ You don't control a nation in this war (no registered TAG "
+                    "matches your nickname). Ask the GM to add your side."
+                )
+            return
+        actor_side = bel[actor_tag]["side"]
+        await self._produce_war_ruling(
+            thread=thread, tid=tid, invocation=message,
+            actor_tag=actor_tag, actor_side=actor_side, is_npc=False,
+            move_text=move_text,
+            source_message_id=str((src_msg or message).id),
+            author_id=str(message.author.id),
+            author_name=message.author.display_name,
+            allow_npc_response=True,
+        )
+
+    async def _war_npcact(self, message, thread, tid, rest):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply("⚠️ No active war here."); return
+        bits = rest.split(maxsplit=1)
+        if not bits:
+            await message.reply(
+                f"Usage: `{self.prefix} war npcact <TAG> [guidance]`"); return
+        tag = bits[0].upper()
+        guidance = bits[1].strip() if len(bits) > 1 else None
+        bel = war.get("belligerents", {})
+        if tag not in bel:
+            await message.reply(
+                f"⚠️ `{tag}` is not a belligerent. Add it with "
+                f"`{self.prefix} war side`."); return
+        if not bel[tag].get("npc"):
+            await message.reply(
+                f"⚠️ `{tag}` is player-controlled. Run "
+                f"`{self.prefix} war npc {tag} on` first if you want the bot to act "
+                f"for it."); return
+        await self._produce_war_npc_move(thread, tid, tag,
+                                         trigger="a GM prompt", guidance=guidance)
+
+    async def _war_cancel(self, message, tid):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply("⚠️ No active war in this thread."); return
+        self.war_store.set_status(tid, "cancelled")
+        self.flog.log_command("war cancel", str(message.author),
+                              getattr(message.channel, "name", "?"), war["war_id"])
+        await message.reply(
+            f"🚫 War **{war['war_id']}** cancelled. Its move log is retained for "
+            f"records, but nothing was written to the archive."
+        )
+
+    # ---- Adjudication engine ----------------------------------------
+    async def _produce_war_ruling(self, *, thread, tid, invocation,
+                                  actor_tag, actor_side, is_npc, move_text,
+                                  source_message_id, author_id, author_name,
+                                  allow_npc_response, guidance=None,
+                                  revision_request=None, existing_move_seq=None,
+                                  old_ruling_seq=None, old_ruling_msg_ids=None,
+                                  is_reroll=False):
+        war_key = (f"{tid}:{existing_move_seq or source_message_id}:"
+                   f"{'rev' if revision_request else 'rr' if is_reroll else 'new'}")
+        if war_key in self._war_inflight:
+            log.info("Skipping duplicate war ruling %s", war_key)
+            return
+        self._war_inflight.add(war_key)
+        try:
+            async with thread.typing():
+                war = self.war_store.get_active_war(tid)
+                if not war:
+                    return
+                ctx = self._war_cfg.get("context", {})
+                budget = int(ctx.get("log_char_budget", 120000))
+                arch_top_k = int(ctx.get("archive_top_k", 12))
+                arch_item = int(ctx.get("archive_item_chars", 4000))
+
+                # 1. Record the move (unless this is a revision/reroll of one)
+                if existing_move_seq is None:
+                    move_seq = self.war_store.append_log(tid, {
+                        "type": "npc_move" if is_npc else "move",
+                        "tag": actor_tag, "side": actor_side, "npc": is_npc,
+                        "author_id": author_id, "author_name": author_name,
+                        "text": move_text, "source_message_id": source_message_id,
+                    })
+                    war = self.war_store.get_active_war(tid) or war
+                else:
+                    move_seq = existing_move_seq
+
+                # 2. Acting nation's established lore from the main archive
+                nation_lore = await self._pull_nation_lore(
+                    actor_tag, move_text, arch_top_k, arch_item
+                )
+
+                # 3. Build context: briefing + digest + verbatim log + lore + move
+                digest = war.get("state_digest") or (
+                    "(No state digest yet — this is early in the war.)")
+                log_text = self._render_war_log(war, budget)
+                parts = [
+                    "=== WAR BRIEFING ===", self._war_briefing(war), "",
+                    "=== WAR STATE DIGEST ===", digest, "",
+                    "=== WAR LOG (verbatim, oldest → newest) ===", log_text, "",
+                    f"=== ACTING NATION: {actor_tag} ({actor_side})"
+                    f"{' — AI-CONTROLLED' if is_npc else ''} ===",
+                    f"--- {actor_tag} established lore from the campaign archive ---",
+                    nation_lore or "(No archive lore found for this nation.)", "",
+                    f"=== MOVE TO ADJUDICATE (this is move #{move_seq}) ===",
+                    move_text,
+                ]
+                if guidance:
+                    parts += ["", "=== GM GUIDANCE ===", guidance]
+                if revision_request:
+                    parts += [
+                        "", "=== GM REVISION REQUEST ===",
+                        "A GM has asked you to revise your prior ruling on this move. "
+                        "Re-issue the ruling in full, adjusted per their direction:",
+                        revision_request,
+                    ]
+                user_content = "\n".join(parts)
+
+                msgs = [
+                    {"role": "system", "content": self.prompts.get("war_move_ruling")},
+                    {"role": "user", "content": user_content},
+                ]
+                _ws = self._mode_settings("war")
+                print(f"{_C_SEND}[WAR      →] move#{move_seq} {actor_tag}"
+                      f"{' [AI]' if is_npc else ''} model={_ws['model'] or 'default'}"
+                      f"  thinking={_fmt_think(_ws['thinking_budget'])}{_C_RST}",
+                      flush=True)
+                ruling, usage = await self.llm.chat_messages(msgs, **_ws)
+                self.state.add_usage("war", usage)
+
+                # 4. Supersede the prior ruling (revision/reroll) and delete its posts
+                if old_ruling_seq is not None:
+                    self.war_store.mark_superseded(tid, old_ruling_seq)
+                if old_ruling_msg_ids:
+                    for mid in old_ruling_msg_ids:
+                        try:
+                            om = await thread.fetch_message(int(mid))
+                            await om.delete()
+                        except (discord.NotFound, discord.Forbidden,
+                                discord.HTTPException, ValueError):
+                            pass
+
+                # 5. Post the ruling
+                label = (" (Revised)" if revision_request else
+                         " (Rerolled)" if is_reroll else "")
+                actor_label = f"AI · {actor_tag}" if is_npc else actor_tag
+                header = (f"⚔️ **{war['war_id']} — Ruling on move #{move_seq}** "
+                          f"({actor_label}){label}")
+                sent_ids: list[str] = []
+                body_ids: list[str] = []
+                m = await thread.send(header)
+                sent_ids.append(str(m.id))
+                for i in range(0, len(ruling), 1900):
+                    mm = await thread.send(ruling[i:i + 1900])
+                    sent_ids.append(str(mm.id))
+                    body_ids.append(str(mm.id))
+
+                # 6. Record the ruling in the war log
+                ruling_seq = self.war_store.append_log(tid, {
+                    "type": "ruling", "of_seq": move_seq, "text": ruling,
+                    "discord_message_ids": sent_ids, "revision_of": old_ruling_seq,
+                })
+
+                if is_npc:
+                    self.state.bump("war_npc_moves")
+                if not (revision_request or is_reroll):
+                    self.state.bump("war_moves_adjudicated")
+
+                # 7. 🎲 reroll reaction + re-adjudication cache
+                if body_ids:
+                    try:
+                        fb = await thread.fetch_message(int(body_ids[0]))
+                        await fb.add_reaction("🎲")
+                    except (discord.NotFound, discord.Forbidden,
+                            discord.HTTPException):
+                        pass
+                cache_entry = {
+                    "thread_id": tid, "war_id": war["war_id"],
+                    "move_seq": move_seq, "ruling_seq": ruling_seq,
+                    "move_text": move_text, "actor_tag": actor_tag,
+                    "actor_side": actor_side, "is_npc": is_npc,
+                    "author_id": author_id, "author_name": author_name,
+                    "source_message_id": source_message_id, "guidance": guidance,
+                    "ruling_msg_ids": sent_ids,
+                }
+                for mid in sent_ids:
+                    self._war_ruling_cache[mid] = cache_entry
+
+                # 8. Update the running state digest incrementally
+                await self._update_war_digest(
+                    tid, war, move_seq, actor_tag, is_npc, move_text, ruling, ruling_seq
+                )
+
+            # 9. Auto-generate AI responses for targeted NPC nations
+            if (allow_npc_response and not is_npc
+                    and self._war_cfg.get("npc_auto_respond", True)):
+                await self._maybe_npc_responses(
+                    thread, tid, actor_tag, actor_side, move_text, ruling
+                )
+        except Exception as e:
+            log.exception("War ruling failed")
+            if invocation is not None:
+                try:
+                    await invocation.reply(f"⚠️ War ruling failed: `{e}`")
+                except discord.HTTPException:
+                    pass
+        finally:
+            self._war_inflight.discard(war_key)
+
+    async def _update_war_digest(self, tid, war, move_seq, actor_tag, is_npc,
+                                 move_text, ruling, ruling_seq):
+        """Regenerate the war-state digest after a ruling (small/cheap model)."""
+        try:
+            current = war.get("state_digest") or "(no digest yet)"
+            user = (
+                f"Current digest:\n{current}\n\n"
+                f"NEW MOVE #{move_seq} by {actor_tag}{' [AI]' if is_npc else ''}:\n"
+                f"{move_text}\n\n"
+                f"RULING:\n{ruling}\n\n"
+                f"Produce the updated digest."
+            )
+            _ds = self._mode_settings("war_digest")
+            digest, usage = await self.llm.chat(
+                self.prompts.get("war_state_digest"),
+                _trim_context_text(user, _GM_WIDER_CONTEXT_CHARS), **_ds,
+            )
+            self.state.add_usage("war", usage)
+            if digest.strip():
+                self.war_store.set_digest(tid, digest.strip(), ruling_seq)
+        except Exception:
+            log.exception("War digest update failed for %s", tid)
+
+    async def _maybe_npc_responses(self, thread, tid, actor_tag, actor_side,
+                                   move_text, ruling):
+        """Generate moves for AI nations on other sides that this move targets."""
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            return
+        bel = war.get("belligerents", {})
+        cap = int(self._war_cfg.get("npc_max_responses_per_move", 2))
+        haystack = f"{move_text}\n{ruling}".upper()
+        targets = []
+        for tag, info in bel.items():
+            if not info.get("npc"):
+                continue
+            if info.get("side") == actor_side:
+                continue
+            if re.search(rf"\b{re.escape(tag)}\b", haystack):
+                targets.append(tag)
+        for tag in targets[:cap]:
+            await self._produce_war_npc_move(
+                thread, tid, tag,
+                trigger=f"{actor_tag}'s move and its outcome", guidance=None,
+            )
+
+    async def _produce_war_npc_move(self, thread, tid, npc_tag,
+                                    trigger=None, guidance=None):
+        """Have the bot declare an AI nation's war move, then adjudicate it."""
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            return
+        bel = war.get("belligerents", {})
+        if npc_tag not in bel:
+            return
+        side = bel[npc_tag]["side"]
+        ctx = self._war_cfg.get("context", {})
+        budget = int(ctx.get("log_char_budget", 120000))
+        arch_top_k = int(ctx.get("archive_top_k", 12))
+        arch_item = int(ctx.get("archive_item_chars", 4000))
+        try:
+            async with thread.typing():
+                nation_lore = await self._pull_nation_lore(
+                    npc_tag, war.get("title", ""), arch_top_k, arch_item
+                )
+                digest = war.get("state_digest") or "(early in the war)"
+                parts = [
+                    "=== WAR BRIEFING ===", self._war_briefing(war), "",
+                    "=== WAR STATE DIGEST ===", digest, "",
+                    "=== WAR LOG (verbatim, oldest → newest) ===",
+                    self._render_war_log(war, budget), "",
+                    f"=== YOU COMMAND: {npc_tag} ({side}) — AI-CONTROLLED ===",
+                    f"--- {npc_tag} established lore from the campaign archive ---",
+                    nation_lore or "(No archive lore found for this nation.)", "",
+                ]
+                if trigger:
+                    parts += [f"You are reacting to: {trigger}.", ""]
+                if guidance:
+                    parts += ["=== GM GUIDANCE ===", guidance, ""]
+                parts += ["Declare this nation's next war move now."]
+                _ns = self._mode_settings("war_npc")
+                print(f"{_C_SEND}[WAR NPC  →] {npc_tag} ({side}) "
+                      f"model={_ns['model'] or 'default'}{_C_RST}", flush=True)
+                move_text, usage = await self.llm.chat(
+                    self.prompts.get("war_npc_move"), "\n".join(parts), **_ns,
+                )
+                self.state.add_usage("war", usage)
+                move_text = (move_text or "").strip()
+                if not move_text:
+                    return
+                await thread.send(f"🤖 **{npc_tag}** ({side}) responds:")
+                for i in range(0, len(move_text), 1900):
+                    await thread.send(move_text[i:i + 1900])
+        except Exception:
+            log.exception("War NPC move generation failed for %s", npc_tag)
+            return
+
+        # Adjudicate the NPC's declared move (no further NPC cascade)
+        synthetic_id = f"npc-{tid}-{npc_tag}-{datetime.now(timezone.utc).timestamp()}"
+        await self._produce_war_ruling(
+            thread=thread, tid=tid, invocation=None,
+            actor_tag=npc_tag, actor_side=side, is_npc=True,
+            move_text=move_text, source_message_id=synthetic_id,
+            author_id="", author_name=f"AI/{npc_tag}",
+            allow_npc_response=False,
+        )
+
+    # ---- War end / chronicle ----------------------------------------
+    def _split_chronicle(self, text: str) -> list[dict]:
+        """Split chronicle text on '=== ENTRY: <title> ===' markers."""
+        marker = re.compile(r"(?m)^===\s*ENTRY:\s*(.+?)\s*===\s*$")
+        matches = list(marker.finditer(text))
+        if not matches:
+            return [{"title": "War Chronicle", "text": text.strip()}]
+        entries = []
+        for i, mt in enumerate(matches):
+            start = mt.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            body = text[start:end].strip()
+            if body:
+                entries.append({"title": mt.group(1).strip(), "text": body})
+        return entries or [{"title": "War Chronicle", "text": text.strip()}]
+
+    async def _war_end(self, message, thread, tid):
+        war = self.war_store.get_active_war(tid)
+        if not war:
+            await message.reply("⚠️ No active war in this thread."); return
+        if not any(e.get("type") == "ruling" for e in war.get("log", [])):
+            await message.reply(
+                "⚠️ This war has no adjudicated moves yet — nothing to chronicle."); return
+        async with thread.typing():
+            user = "\n".join([
+                "=== WAR BRIEFING ===", self._war_briefing(war), "",
+                "=== FINAL STATE DIGEST ===",
+                war.get("state_digest") or "(no digest)", "",
+                "=== COMPLETE WAR LOG (verbatim, oldest → newest) ===",
+                self._render_war_log(war, 1_000_000),
+            ])
+            _cs = self._mode_settings("war_chronicle")
+            print(f"{_C_SEND}[WAR END  →] chronicle for {war['war_id']} "
+                  f"model={_cs['model'] or 'default'}{_C_RST}", flush=True)
+            chronicle, usage = await self.llm.chat(
+                self.prompts.get("war_chronicle"),
+                _trim_context_text(user, _GM_PRIOR_CONTEXT_CHARS), **_cs,
+            )
+            self.state.add_usage("war", usage)
+        entries = self._split_chronicle(chronicle)
+        self.war_store.set_chronicle_draft(tid, entries)
+        self.war_store.set_status(tid, "pending_commit")
+        self.flog.log_command("war end", str(message.author), thread.name,
+                              war["war_id"])
+        plural = "entry" if len(entries) == 1 else "entries"
+        await thread.send(
+            f"📜 **Draft chronicle for {war['war_id']} — {war.get('title', '')}** "
+            f"({len(entries)} {plural}). Review below, then a GM runs "
+            f"`{self.prefix} war commit` to write it to the archive — or "
+            f"`{self.prefix} war cancel` to discard. (Re-run `{self.prefix} war end` "
+            f"to regenerate the draft.)"
+        )
+        for e in entries:
+            await thread.send(f"**{e['title']}**")
+            for i in range(0, len(e["text"]), 1900):
+                await thread.send(e["text"][i:i + 1900])
+
+    async def _war_commit(self, message, thread, tid):
+        war = self.war_store.get_war(tid)
+        if not war:
+            await message.reply("⚠️ No war in this thread."); return
+        if war.get("status") != "pending_commit":
+            await message.reply(
+                f"⚠️ This war isn't awaiting commit (status: {war.get('status')}). "
+                f"Run `{self.prefix} war end` first."); return
+        entries = war.get("chronicle_draft", [])
+        if not entries:
+            await message.reply(
+                f"⚠️ No chronicle draft found. Run `{self.prefix} war end` again."); return
+        year = self.state.current_year
+        participants = ",".join(sorted(war.get("belligerents", {}).keys()))
+        stored = 0
+        async with thread.typing():
+            for idx, e in enumerate(entries, 1):
+                text = f"{e['title']}\n\n{e['text']}"
+                try:
+                    embed, usage = await self.llm.embed(
+                        _trim_context_text(text, _EMBED_INPUT_CHARS)
+                    )
+                    self.state.add_usage("embedding", usage)
+                    self.memory.add(
+                        text=text, embedding=embed,
+                        metadata={
+                            "source_message_id": f"{war['war_id']}-chronicle-{idx}",
+                            "author_id": "", "author_name": "War Chronicle",
+                            "author_discord_name": "DNC",
+                            "channel": thread.name, "channel_id": tid,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "year": int(year), "entry_type": "war_chronicle",
+                            "war_id": war["war_id"], "war_title": war.get("title", ""),
+                            "war_participants": participants, "war_thread_id": tid,
+                            "chronicle_part": idx, "chronicle_total": len(entries),
+                            "has_image": False,
+                            "full_message_text": text, "original_excerpt": text[:500],
+                        },
+                    )
+                    stored += 1
+                except Exception:
+                    log.exception("Failed to store war chronicle entry %d", idx)
+        self.war_store.set_status(tid, "ended")
+        self.state.bump("wars_ended")
+        self.flog.log_command("war commit", str(message.author), thread.name,
+                              f"{war['war_id']} {stored} entries")
+        plural = "entry" if stored == 1 else "entries"
+        await message.reply(
+            f"✅ Committed **{stored}** chronicle {plural} for **{war['war_id']}** to "
+            f"the archive (total memories now {self.memory.count()}). This war is "
+            f"now closed."
+        )
 
     # ------------------------------------------------------------------
     # Memory ingestion
@@ -2826,6 +3669,7 @@ class LoreBot(commands.Bot):
             + s.get("chat_prompt_tokens", 0) + s.get("chat_completion_tokens", 0)
             + s.get("chatuc_prompt_tokens", 0) + s.get("chatuc_completion_tokens", 0)
             + s.get("gm_prompt_tokens", 0) + s.get("gm_completion_tokens", 0)
+            + s.get("war_prompt_tokens", 0) + s.get("war_completion_tokens", 0)
             + s.get("embedding_tokens", 0)
         )
 
@@ -2852,6 +3696,10 @@ class LoreBot(commands.Bot):
             f"chatuc answered       {s.get('chatuc_answered', 0):>8}\n"
             f"GM rulings made       {s.get('gm_rulings_made', 0):>8}\n"
             f"GM rulings revised    {s.get('gm_rulings_revised', 0):>8}\n"
+            f"wars started          {s.get('wars_started', 0):>8}\n"
+            f"war moves adjudicated {s.get('war_moves_adjudicated', 0):>8}\n"
+            f"war AI moves          {s.get('war_npc_moves', 0):>8}\n"
+            f"wars ended            {s.get('wars_ended', 0):>8}\n"
             f"voids                 {s.get('voids_executed', 0):>8}\n"
             f"unvoids               {s.get('unvoids_executed', 0):>8}\n"
             f"\n"
@@ -2861,6 +3709,7 @@ class LoreBot(commands.Bot):
             f"chat       {s.get('chat_prompt_tokens', 0):>10} / {s.get('chat_completion_tokens', 0):<10}\n"
             f"chatuc     {s.get('chatuc_prompt_tokens', 0):>10} / {s.get('chatuc_completion_tokens', 0):<10}\n"
             f"gm         {s.get('gm_prompt_tokens', 0):>10} / {s.get('gm_completion_tokens', 0):<10}\n"
+            f"war        {s.get('war_prompt_tokens', 0):>10} / {s.get('war_completion_tokens', 0):<10}\n"
             f"embeddings {s.get('embedding_tokens', 0):>10} (total)\n"
             f"GRAND TOTAL TOKENS    {all_tokens:>8}\n"
             f"```"
@@ -3571,6 +4420,10 @@ class LoreCog(commands.Cog):
     @commands.command(name="gm")
     async def gm(self, ctx: commands.Context, *, arg: str = ""):
         await self.bot._cmd_gm(ctx.message, arg)
+
+    @commands.command(name="war")
+    async def war(self, ctx: commands.Context, *, arg: str = ""):
+        await self.bot._cmd_war(ctx.message, arg)
 
     @commands.command(name="optout")
     async def optout(self, ctx: commands.Context):
