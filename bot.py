@@ -2018,9 +2018,18 @@ class LoreBot(commands.Bot):
                 tmsg = await message.channel.fetch_message(message.reference.message_id)
                 imgs = [a.url for a in tmsg.attachments
                         if a.content_type and a.content_type.startswith("image/")]
-                return (await self._message_text_with_documents(tmsg)).strip(), tmsg, imgs
+                text = (await self._message_text_with_documents(tmsg)).strip()
+                # If the referenced message has only images and no text, use a placeholder
+                if not text and imgs:
+                    text = "[See attached image(s) for the move.]"
+                return text, tmsg, imgs
             except Exception:
                 return "", None, []
+        # No text, no reply — check if images were attached directly to the command message
+        imgs = [a.url for a in message.attachments
+                if a.content_type and a.content_type.startswith("image/")]
+        if imgs:
+            return "[See attached image(s) for the move.]", None, imgs
         return "", None, []
 
     async def _war_move(self, message, thread, tid, rest):
