@@ -497,6 +497,15 @@ def _province_gdf() -> gpd.GeoDataFrame:
             "cy": prov.centroid[1],
             "geometry": geom,
         })
+    if not rows:
+        # No province data available — return an empty frame that still has a
+        # geometry column so callers can rely on `.empty` rather than crash.
+        _PROVINCE_GDF = gpd.GeoDataFrame(
+            {"province_id": [], "iso_cc": [], "name": [], "cx": [], "cy": []},
+            geometry=[], crs="EPSG:4326",
+        )
+        log.warning("No province data found; province layer will be skipped")
+        return _PROVINCE_GDF
     _PROVINCE_GDF = gpd.GeoDataFrame(rows, crs="EPSG:4326")
     log.info("Built province GeoDataFrame with %d features", len(_PROVINCE_GDF))
     return _PROVINCE_GDF
@@ -970,6 +979,181 @@ def _render_zoom_sync(
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def _collect_symbol_lonlats(symbols: list) -> list[tuple[float, float]]:
+    """Pull every (lon, lat) a symbol references, for theater bounds fitting."""
+    pts: list[tuple[float, float]] = []
+    for s in symbols or []:
+        kind = (s.get("kind") or "unit").lower()
+        if kind in ("unit", "objective"):
+            if s.get("lon") is not None and s.get("lat") is not None:
+                pts.append((float(s["lon"]), float(s["lat"])))
+        elif kind == "arrow":
+            for key in ("from", "to"):
+                p = s.get(key)
+                if p:
+                    pts.append((float(p[0]), float(p[1])))
+        elif kind == "frontline":
+            for p in s.get("points") or []:
+                pts.append((float(p[0]), float(p[1])))
+    return pts
+
+
+def _shift_symbol(sym: dict, lon_0: float) -> dict:
+    """Return a copy of ``sym`` with every longitude shifted into the lon_0 window."""
+    out = dict(sym)
+    kind = (sym.get("kind") or "unit").lower()
+    if kind in ("unit", "objective") and sym.get("lon") is not None:
+        out["lon"] = float(sym["lon"]) + _lon_shift_amount(float(sym["lon"]), lon_0)
+    elif kind == "arrow":
+        for key in ("from", "to"):
+            p = sym.get(key)
+            if p:
+                out[key] = [float(p[0]) + _lon_shift_amount(float(p[0]), lon_0), float(p[1])]
+    elif kind == "frontline":
+        out["points"] = [
+            [float(p[0]) + _lon_shift_amount(float(p[0]), lon_0), float(p[1])]
+            for p in (sym.get("points") or [])
+        ]
+    return out
+
+
+def _render_theater_sync(
+    tags: list[str],
+    occupation: dict[str, OccupiedNation],
+    province_ownership: dict,
+    symbols: list,
+    buffer_deg: float,
+    title: str,
+    subtitle: str,
+    year: int,
+) -> bytes:
+    """Render a tactical theater map: a plate-carrée view fitted to the
+    belligerents (and any symbols placed outside their borders), with a NATO
+    symbology overlay drawn on top."""
+    import nato_symbols
+
+    world = _world()
+    names = []
+    for tag in tags:
+        nm = TAG_TO_NAME.get(tag.upper())
+        if nm:
+            names.append(nm.strip())
+    names = list(dict.fromkeys(names))  # de-dupe, keep order
+    target = world[world["NAME"].isin(names)] if names else world.iloc[0:0]
+
+    sym_pts = _collect_symbol_lonlats(symbols)
+
+    # Central longitude: from belligerent geometry if present, else from the
+    # mean of symbol longitudes, else 0.
+    if not target.empty:
+        lon_0 = _geographic_center_lon(target)
+    elif sym_pts:
+        lon_0 = ((sum(p[0] for p in sym_pts) / len(sym_pts) + 180) % 360) - 180
+    else:
+        lon_0 = 0.0
+
+    world_shifted = world.copy()
+    world_shifted["geometry"] = world_shifted.geometry.apply(
+        lambda g: _shift_geom_to_window(g, lon_0)
+    )
+    target_shifted = world_shifted[world_shifted["NAME"].isin(names)] if names else world_shifted.iloc[0:0]
+    symbols_shifted = [_shift_symbol(s, lon_0) for s in (symbols or [])]
+
+    # Bounds: union of belligerent extents and all symbol coordinates.
+    xs: list[float] = []
+    ys: list[float] = []
+    if not target_shifted.empty:
+        b = target_shifted.total_bounds  # minx, miny, maxx, maxy
+        xs += [b[0], b[2]]
+        ys += [b[1], b[3]]
+    for s in symbols_shifted:
+        for lon, lat in _collect_symbol_lonlats([s]):
+            xs.append(lon)
+            ys.append(lat)
+    if not xs or not ys:
+        # Nothing to anchor on — fall back to a whole-world view.
+        xs, ys = [-170.0, 170.0], [-80.0, 80.0]
+
+    xlim = (min(xs) - buffer_deg, max(xs) + buffer_deg)
+    ylim = (max(-90.0, min(ys) - buffer_deg), min(90.0, max(ys) + buffer_deg))
+
+    lat_center = max(-85.0, min(85.0, (ylim[0] + ylim[1]) / 2.0))
+    aspect = 1.0 / max(0.1, math.cos(math.radians(lat_center)))
+
+    colors = _fill_colors(world_shifted, occupation)
+
+    fig, ax = plt.subplots(1, 1, figsize=(16, 10), facecolor=_OCEAN_COLOR)
+    ax.set_facecolor(_OCEAN_COLOR)
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_aspect(aspect)
+
+    _draw_graticule(ax, xlim, ylim)
+
+    # Layer 0: base nation fills
+    world_shifted.plot(ax=ax, color=colors, edgecolor=_BORDER_COLOR, linewidth=0.6)
+
+    # Layer 1: province subdivisions, longitude-shifted to the same window
+    label_sink: list[dict] = []
+    _add_province_layer(
+        ax, province_ownership, occupation,
+        xlim=xlim, ylim=ylim,
+        fontsize=8, show_labels=True, lon_0=lon_0, labels=label_sink,
+    )
+
+    # Layer 2: belligerent country outlines (warm highlight)
+    if not target_shifted.empty:
+        target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_GLOW, linewidth=6.0)
+        target_shifted.plot(ax=ax, color="none", edgecolor=_HIGHLIGHT_EDGE, linewidth=2.0)
+
+    # Layer 3: country labels for occupied belligerents
+    _add_labels(ax, world_shifted, occupation, xlim=xlim, ylim=ylim,
+                fontsize=12, labels=label_sink)
+    _place_labels(ax, fig, label_sink)
+
+    # Layer 4: NATO tactical symbology overlay
+    nato_symbols.overlay_symbols(ax, symbols_shifted)
+
+    ax.set_axis_off()
+    _style_title(ax, title or "THEATER MAP", subtitle or str(year))
+    _frame(fig, ax)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                pad_inches=0.25, facecolor=_OCEAN_COLOR)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+async def render_theater_map(
+    tags: list[str],
+    occupation: dict[str, OccupiedNation],
+    province_ownership: Optional[dict] = None,
+    symbols: Optional[list] = None,
+    buffer_deg: float = 3.0,
+    title: str = "THEATER MAP",
+    subtitle: str = "",
+    year: int = 1970,
+    **_,
+) -> bytes:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        partial(
+            _render_theater_sync,
+            list(tags or []),
+            occupation,
+            province_ownership or {},
+            list(symbols or []),
+            buffer_deg,
+            title,
+            subtitle,
+            year,
+        ),
+    )
 
 
 async def render_world_map(

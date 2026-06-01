@@ -148,6 +148,10 @@ class WarStore:
                 "state_digest": "",
                 "digest_updated_seq": 0,
                 "chronicle_draft": [],
+                # Tactical map: live NATO symbology + per-move snapshots so a
+                # reroll/revise can restore the battlefield before re-applying.
+                "map_state": {"symbols": [], "updated_seq": 0},
+                "map_snapshots": {},
             }
             self._data["wars"][str(thread_id)] = war
             self._save()
@@ -258,3 +262,71 @@ class WarStore:
                 return
             war["chronicle_draft"] = list(entries)
             self._save()
+
+    # ------------------------------------------------------------------
+    # Tactical map state (NATO symbology)
+    # ------------------------------------------------------------------
+    def get_map_state(self, thread_id: str) -> Dict[str, Any]:
+        """Return the live map state ``{"symbols": [...], "updated_seq": int}``."""
+        war = self.get_war(thread_id)
+        if not war:
+            return {"symbols": [], "updated_seq": 0}
+        state = war.get("map_state") or {}
+        return {
+            "symbols": list(state.get("symbols", [])),
+            "updated_seq": int(state.get("updated_seq", 0)),
+        }
+
+    def get_map_symbols(self, thread_id: str) -> List[Dict[str, Any]]:
+        return self.get_map_state(thread_id)["symbols"]
+
+    def set_map_state(
+        self, thread_id: str, symbols: List[Dict[str, Any]], updated_seq: int
+    ) -> None:
+        with self._lock:
+            war = self._data["wars"].get(str(thread_id))
+            if not war:
+                return
+            war["map_state"] = {
+                "symbols": list(symbols),
+                "updated_seq": int(updated_seq),
+            }
+            self._save()
+
+    def snapshot_map_state(self, thread_id: str, seq: int) -> None:
+        """Record the *current* symbols as the pre-move snapshot for ``seq``.
+
+        Idempotent: the first snapshot for a given seq wins, so re-adjudicating
+        the same move always rolls back to the same battlefield.
+        """
+        with self._lock:
+            war = self._data["wars"].get(str(thread_id))
+            if not war:
+                return
+            snaps = war.setdefault("map_snapshots", {})
+            key = str(seq)
+            if key in snaps:
+                return
+            state = war.get("map_state") or {}
+            snaps[key] = list(state.get("symbols", []))
+            self._save()
+
+    def restore_map_snapshot(self, thread_id: str, seq: int) -> bool:
+        """Restore the battlefield to the snapshot taken before move ``seq``.
+
+        Returns True if a snapshot existed and was restored.
+        """
+        with self._lock:
+            war = self._data["wars"].get(str(thread_id))
+            if not war:
+                return False
+            snaps = war.get("map_snapshots") or {}
+            key = str(seq)
+            if key not in snaps:
+                return False
+            war["map_state"] = {
+                "symbols": list(snaps[key]),
+                "updated_seq": int(seq) - 1,
+            }
+            self._save()
+            return True
