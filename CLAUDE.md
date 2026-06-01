@@ -17,7 +17,7 @@ Non-command messages in scanned channels are buffered (consecutive same-author p
 - Multi-turn conversations via reply-chain reconstruction (chat / chatuc / query / gm modes)
 - Role-based permissions: `admin`, `gm`, `chatuc`, `war` roles
 - GM adjudication (`!DNC gm <link>`) with author-history + semantic retrieval, query expansion, revise-by-reply, 🎲 reroll
-- **War GM mode** (`!DNC war …`): thread-scoped wars with verbatim move memory, AI-controlled belligerents, and end-of-war chronicles
+- **War GM mode** (`!DNC war …`): thread-scoped wars with verbatim move memory, AI-controlled belligerents, end-of-war chronicles, and a per-war **tactical map** with NATO/APP-6 symbology
 - Vision/OCR ingestion of images; PDF/DOCX text extraction + chunking
 - Espionage: spies intercept secret-channel posts probabilistically
 - Spatial mapping: world map, country zoom, faction map, real ArcGIS provinces, LLM-driven ownership changes
@@ -35,7 +35,7 @@ Non-command messages in scanned channels are buffered (consecutive same-author p
 - `state_store.py`: atomic JSON runtime state (year, stats, per-year ruling/war ID counters).
 
 **Subsystems**
-- `war_store.py`: JSON store for thread-scoped wars (verbatim move/ruling log + maintained state digest + chronicle draft).
+- `war_store.py`: JSON store for thread-scoped wars (verbatim move/ruling log + maintained state digest + chronicle draft + tactical-map state with per-move snapshots + theater focus).
 - `espionage_store.py`: JSON store for spy targets / counterspy state.
 - `optout_store.py`: plain-text opt-out registry (thread-safe).
 - `chat_blacklist.py`: plain-text blacklist for chat commands.
@@ -45,9 +45,11 @@ Non-command messages in scanned channels are buffered (consecutive same-author p
 **Spatial mapping**
 - `map_store.py`: runtime tag→player occupation (rebuilt from nicknames).
 - `map_colors.py`: persistent tag→hex color assignments.
-- `map_renderer.py`: matplotlib/geopandas world/zoom/faction renderers; `TAG_TO_ISO2` mappings.
+- `map_renderer.py`: matplotlib/geopandas world/zoom/faction renderers + `render_theater_map` (focus-fitted war map with a NATO-symbology overlay); `TAG_TO_ISO2` mappings.
+- `nato_symbols.py`: simplified APP-6/NATO symbology drawn on a matplotlib axis — unit icons (affiliation frame + echelon + branch glyph + HQ staff) at fixed screen size, plus geographic frontlines/arrows/objectives.
 - `map_geometry.py`: geometry helpers (radius, bordering, in-country) for the map LLM.
 - `map_llm.py`: tool-driven LLM frontend that proposes province-ownership changes.
+- `war_map_llm.py`: tool-driven LLM frontend for the war tactical map. Reuses map_llm's geometry tools and adds war-map tools (place/move units, frontlines, arrows, objectives, set_focus, check_realism). Mutates a live symbol set seeded from the war's map state; `check_realism` is advisory (warn + reflect, never block).
 - `province_store.py` / `province_generator.py` / `arcgis_provinces.py`: real administrative-division province data + ownership state.
 - `map_cache.py`: in-memory + on-disk cache for the rendered world map.
 - `map_scheduler.py` / `year_scheduler.py`: periodic nickname scans / year-rollover task.
@@ -110,6 +112,7 @@ Thread-scoped wars adjudicated with maximal memory fidelity. Lifecycle:
 3. `!DNC war move <text|message-link>` (a registered belligerent or GM) → the move is appended to the war log and **adjudicated immediately**. The ruling context is the **entire verbatim war log** (within `war.context.log_char_budget`, with older entries covered by the digest) + the maintained **state digest** + the acting nation's lore pulled from the main archive + the move. Five-tier outcomes, posted in-thread.
 4. **AI belligerents**: when a player move targets an AI nation, the bot generates that nation's in-character move (grounded in its archive lore), posts it (`🤖 TAG responds:`), and adjudicates it through the same engine. NPC moves never cascade into further NPC moves. `!DNC war npcact <TAG> [guidance]` triggers one manually.
 5. After each ruling the **state digest** (forces/territory/casualties per side) is regenerated incrementally by a cheap model.
+5b. **Tactical map** (if `war.map.enabled` + `auto_update`): a second cheap tool-driven pass (`war_map_llm`) updates the battlefield's NATO symbology from the move + ruling, then a focus-fitted **theater map** is rendered and posted in-thread with any ⚠️ realism flags. The map state + per-move snapshots + theater focus persist in `wars.json`; a reroll/revise restores the pre-move snapshot before re-deriving the delta. GMs drive it directly with `!DNC war map [focus <place|TAG|auto> | <instructions>]`. **Distant wars**: by default the theater frames on the placed symbols (the actual fighting), and the LLM can `set_focus` (or a GM can `war map focus`) so e.g. a US–Cuba war shows Cuba, not the ocean between them.
 6. Revise a ruling by **replying** to it (GM), or **🎲-react** to reroll (submitter or GM). The old ruling is superseded in the log and its messages deleted.
 7. `!DNC war end` (GM) → drafts one or more chronicle entries in-thread (split on `=== ENTRY: … ===`) and sets status `pending_commit`. `!DNC war commit` (GM) embeds and writes each entry to the main `lore` DB as `entry_type: "war_chronicle"` and closes the war. `!DNC war cancel` abandons it (log retained, nothing archived).
 
@@ -140,10 +143,11 @@ Walk `message.reference` backward to the root invocation (bounded), keep up to `
 | discord/roles | admin / chatuc | Role names |
 | gm | roles / channels / output_channel / retrieval.* | GM mode permissions, location, retrieval tuning |
 | **war** | **roles / npc_auto_respond / npc_max_responses_per_move / context.{log_char_budget,archive_top_k,archive_item_chars}** | **War mode permissions, NPC behavior, ruling context budgets** |
+| **war/map** | **enabled / auto_update / buffer_deg / max_advance_km / max_tool_depth** | **War tactical map: master switch, auto-update after each ruling, theater padding, realism advance threshold, tool depth** |
 | models/provider | base_url / embedding_base_url / site_* | API endpoints |
 | models/defaults | model / temperature | Fallback LLM settings |
 | models | vision_model / embedding_model | Specialized models |
-| models/modes | chat, chatuc, query, gm, **war, war_npc, war_digest, war_chronicle**, archivist | Per-mode model/temperature/thinking_budget |
+| models/modes | chat, chatuc, query, gm, **war, war_npc, war_digest, war_chronicle, war_map**, archivist | Per-mode model/temperature/thinking_budget |
 | memory | db_path / top_k / filter_non_lore / void_retention_days / store_full_message | Vector store behavior |
 | tavily | enabled_modes / max_results / search_depth | Web search per mode |
 | spatial_mapping | enabled / output_channel / map_llm_* / province_*_path / color_palette | Map system |
@@ -167,6 +171,7 @@ Walk `message.reference` backward to the root invocation (bounded), keep up to `
 **War mode** (inside the war's thread):
 - `!DNC war start <title>` (GM), `!DNC war side <Side> <TAG|@player>…` (GM), `!DNC war npc <TAG> [on|off]` (GM)
 - `!DNC war move <text|message-link>` (belligerent/GM), `!DNC war npcact <TAG> [guidance]` (GM)
+- `!DNC war map [focus <place|TAG|auto> | <instructions>]` (GM) — post / frame / directly edit the tactical map
 - `!DNC war status`, `!DNC war end` (GM), `!DNC war commit` (GM), `!DNC war cancel` (GM)
 
 **Admin** (admin channels + admin users):
@@ -199,7 +204,7 @@ Add a block under `models.modes.<mode>` in `config.yaml`; read it via `self._mod
 ## State & Data Persistence
 
 - **state.json**: year, stats, per-year `gm_ruling_counter_*` / `war_counter_*`. Atomic unique-temp-then-rename.
-- **wars.json**: per-thread war records (sides, belligerents, ordered log, digest, chronicle draft).
+- **wars.json**: per-thread war records (sides, belligerents, ordered log, digest, chronicle draft, tactical-map state + per-move snapshots + theater focus).
 - **espionage.json / optouts.txt / chat_blacklist.txt / map_colors.txt / province_ownership.json**: feature state.
 - **memory_store/**: ChromaDB — back this up if lore matters. `voided_memories.jsonl` holds tombstones.
 - **logs/**: daily ingestion/command logs, append-only void + map-change logs.
