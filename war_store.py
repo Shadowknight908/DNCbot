@@ -152,6 +152,9 @@ class WarStore:
                 # reroll/revise can restore the battlefield before re-applying.
                 "map_state": {"symbols": [], "updated_seq": 0},
                 "map_snapshots": {},
+                # Theater framing. "auto" fits to the placed symbols (the actual
+                # fighting), so a US–Cuba war frames on Cuba, not the Atlantic.
+                "map_focus": {"mode": "auto"},
             }
             self._data["wars"][str(thread_id)] = war
             self._save()
@@ -309,6 +312,20 @@ class WarStore:
                 return
             state = war.get("map_state") or {}
             snaps[key] = list(state.get("symbols", []))
+            self._save()
+
+    def get_map_focus(self, thread_id: str) -> Dict[str, Any]:
+        """Return the theater framing, defaulting to auto-fit on the symbols."""
+        war = self.get_war(thread_id)
+        focus = (war or {}).get("map_focus") if war else None
+        return dict(focus) if focus else {"mode": "auto"}
+
+    def set_map_focus(self, thread_id: str, focus: Dict[str, Any]) -> None:
+        with self._lock:
+            war = self._data["wars"].get(str(thread_id))
+            if not war:
+                return
+            war["map_focus"] = dict(focus or {"mode": "auto"})
             self._save()
 
     def restore_map_snapshot(self, thread_id: str, seq: int) -> bool:

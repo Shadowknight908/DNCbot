@@ -981,6 +981,20 @@ def _render_zoom_sync(
     return buf.read()
 
 
+def _clamp_span(lim: tuple[float, float], min_span: float,
+                max_span: float, lo: float = -360.0, hi: float = 360.0) -> tuple[float, float]:
+    """Expand a (low, high) range up to min_span or shrink it to max_span,
+    keeping it centered, then clamp the endpoints to [lo, hi]."""
+    a, b = lim
+    span = b - a
+    center = (a + b) / 2.0
+    if span < min_span:
+        a, b = center - min_span / 2.0, center + min_span / 2.0
+    elif span > max_span:
+        a, b = center - max_span / 2.0, center + max_span / 2.0
+    return (max(lo, a), min(hi, b))
+
+
 def _collect_symbol_lonlats(symbols: list) -> list[tuple[float, float]]:
     """Pull every (lon, lat) a symbol references, for theater bounds fitting."""
     pts: list[tuple[float, float]] = []
@@ -1028,6 +1042,7 @@ def _render_theater_sync(
     title: str,
     subtitle: str,
     year: int,
+    focus: Optional[dict] = None,
 ) -> bytes:
     """Render a tactical theater map: a plate-carrée view fitted to the
     belligerents (and any symbols placed outside their borders), with a NATO
@@ -1044,13 +1059,37 @@ def _render_theater_sync(
     target = world[world["NAME"].isin(names)] if names else world.iloc[0:0]
 
     sym_pts = _collect_symbol_lonlats(symbols)
+    focus = focus or {"mode": "auto"}
+    fmode = (focus.get("mode") or "auto").lower()
 
-    # Central longitude: from belligerent geometry if present, else from the
-    # mean of symbol longitudes, else 0.
-    if not target.empty:
-        lon_0 = _geographic_center_lon(target)
+    # Focus-tag subset (explicit theater framing on a country / countries).
+    focus_names: list[str] = []
+    if fmode == "tags":
+        for t in focus.get("tags", []) or []:
+            nm = TAG_TO_NAME.get(str(t).upper())
+            if nm:
+                focus_names.append(nm.strip())
+
+    # --- Central longitude (chosen before shifting everything into a window) ---
+    # Priority: explicit focus → the placed symbols (the actual fighting) →
+    # belligerent geometry → 0. Fitting to symbols is what keeps a distant war
+    # (e.g. a US landing in Cuba) framed on the theater rather than the ocean.
+    def _mean_lon(pts):
+        return ((sum(p[0] for p in pts) / len(pts) + 180) % 360) - 180
+
+    if fmode == "place" and focus.get("lon") is not None:
+        lon_0 = float(focus["lon"])
+    elif fmode == "bbox" and focus.get("bbox"):
+        bb = focus["bbox"]
+        lon_0 = (float(bb[0]) + float(bb[2])) / 2.0
+    elif fmode == "tags" and focus_names:
+        sub = world[world["NAME"].isin(focus_names)]
+        lon_0 = _geographic_center_lon(sub) if not sub.empty else (
+            _mean_lon(sym_pts) if sym_pts else 0.0)
     elif sym_pts:
-        lon_0 = ((sum(p[0] for p in sym_pts) / len(sym_pts) + 180) % 360) - 180
+        lon_0 = _mean_lon(sym_pts)
+    elif not target.empty:
+        lon_0 = _geographic_center_lon(target)
     else:
         lon_0 = 0.0
 
@@ -1060,24 +1099,52 @@ def _render_theater_sync(
     )
     target_shifted = world_shifted[world_shifted["NAME"].isin(names)] if names else world_shifted.iloc[0:0]
     symbols_shifted = [_shift_symbol(s, lon_0) for s in (symbols or [])]
+    shifted_pts = _collect_symbol_lonlats(symbols_shifted)
 
-    # Bounds: union of belligerent extents and all symbol coordinates.
+    # --- Extent (in the shifted window) ---
     xs: list[float] = []
     ys: list[float] = []
-    if not target_shifted.empty:
-        b = target_shifted.total_bounds  # minx, miny, maxx, maxy
+    if fmode == "place" and focus.get("lon") is not None and focus.get("lat") is not None:
+        clon = float(focus["lon"]) + _lon_shift_amount(float(focus["lon"]), lon_0)
+        clat = float(focus["lat"])
+        radius_km = float(focus.get("radius_km", 500.0) or 500.0)
+        dlat = radius_km / 111.0
+        dlon = radius_km / max(1.0, 111.0 * math.cos(math.radians(clat)))
+        xs += [clon - dlon, clon + dlon]
+        ys += [clat - dlat, clat + dlat]
+    elif fmode == "bbox" and focus.get("bbox"):
+        bb = focus["bbox"]
+        xs += [float(bb[0]) + _lon_shift_amount(float(bb[0]), lon_0),
+               float(bb[2]) + _lon_shift_amount(float(bb[2]), lon_0)]
+        ys += [float(bb[1]), float(bb[3])]
+    elif fmode == "tags" and focus_names:
+        fsub = world_shifted[world_shifted["NAME"].isin(focus_names)]
+        if not fsub.empty:
+            b = fsub.total_bounds
+            xs += [b[0], b[2]]
+            ys += [b[1], b[3]]
+        for lon, lat in shifted_pts:  # keep any symbols outside the focus country in view
+            xs.append(lon); ys.append(lat)
+    elif shifted_pts:
+        # AUTO with symbols: frame purely on the fighting.
+        for lon, lat in shifted_pts:
+            xs.append(lon); ys.append(lat)
+    elif not target_shifted.empty:
+        # AUTO, no symbols yet: fall back to the belligerents' extents.
+        b = target_shifted.total_bounds
         xs += [b[0], b[2]]
         ys += [b[1], b[3]]
-    for s in symbols_shifted:
-        for lon, lat in _collect_symbol_lonlats([s]):
-            xs.append(lon)
-            ys.append(lat)
+
     if not xs or not ys:
-        # Nothing to anchor on — fall back to a whole-world view.
         xs, ys = [-170.0, 170.0], [-80.0, 80.0]
 
     xlim = (min(xs) - buffer_deg, max(xs) + buffer_deg)
     ylim = (max(-90.0, min(ys) - buffer_deg), min(90.0, max(ys) + buffer_deg))
+    # Sanity clamp: never zoom tighter than MIN_SPAN (a lone unit shouldn't fill
+    # the canvas) and, when auto-fitting symbols, never sprawl past MAX_SPAN.
+    _MIN_SPAN, _MAX_SPAN = 4.0, 90.0
+    xlim = _clamp_span(xlim, _MIN_SPAN, _MAX_SPAN)
+    ylim = _clamp_span(ylim, _MIN_SPAN, _MAX_SPAN, lo=-90.0, hi=90.0)
 
     lat_center = max(-85.0, min(85.0, (ylim[0] + ylim[1]) / 2.0))
     aspect = 1.0 / max(0.1, math.cos(math.radians(lat_center)))
@@ -1137,6 +1204,7 @@ async def render_theater_map(
     title: str = "THEATER MAP",
     subtitle: str = "",
     year: int = 1970,
+    focus: Optional[dict] = None,
     **_,
 ) -> bytes:
     loop = asyncio.get_running_loop()
@@ -1152,6 +1220,7 @@ async def render_theater_map(
             title,
             subtitle,
             year,
+            focus,
         ),
     )
 

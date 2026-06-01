@@ -19,7 +19,7 @@ import random
 import re
 import sys
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import discord
 import yaml
@@ -53,6 +53,8 @@ from nickname_parser import parse_tag
 from province_store import ProvinceStore
 from map_cache import MapCache
 import map_llm
+import map_geometry
+import war_map_llm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -271,6 +273,7 @@ class LoreBot(commands.Bot):
         # War GM mode configuration
         war_cfg = config.get("war", {})
         self._war_cfg = war_cfg
+        self._war_map_cfg = war_cfg.get("map", {}) or {}
         self._war_roles = {
             r.strip().lower() for r in war_cfg.get("roles", []) or []
             if r and isinstance(r, str)
@@ -1728,6 +1731,9 @@ class LoreBot(commands.Bot):
             f"`{p} war npc <TAG> [on|off]` — toggle AI control of a nation *(GM)*",
             f"`{p} war move <text|message-link>` — submit & adjudicate a move *(belligerents)*",
             f"`{p} war npcact <TAG> [guidance]` — make an AI nation act now *(GM)*",
+            f"`{p} war map` — post the current tactical map *(GM)*",
+            f"`{p} war map focus <place|TAG|auto>` — frame the theater *(GM)*",
+            f"`{p} war map <instructions>` — directly edit the tactical map *(GM)*",
             f"`{p} war status` — show sides + the current war-state digest",
             f"`{p} war end` — draft the war chronicle *(GM)*",
             f"`{p} war commit` — write the chronicle to the archive *(GM)*",
@@ -1863,6 +1869,8 @@ class LoreBot(commands.Bot):
             await self._war_npc_toggle(message, tid, rest)
         elif sub == "npcact":
             await self._war_npcact(message, thread, tid, rest)
+        elif sub == "map":
+            await self._war_map_cmd(message, thread, tid, rest)
         elif sub == "end":
             await self._war_end(message, thread, tid)
         elif sub == "commit":
@@ -1988,6 +1996,13 @@ class LoreBot(commands.Bot):
             f"**State digest:**\n{digest}"
         )
         await self._send_chunked_reply(message, body)
+        # Surface the current tactical map alongside the digest, if any.
+        if self._war_map_cfg.get("enabled"):
+            state = self.war_store.get_map_state(tid)
+            if state["symbols"]:
+                await self._render_and_post_war_map(
+                    message.channel, tid, war, "latest", state["symbols"],
+                    self.war_store.get_map_focus(tid), [])
 
     async def _resolve_war_move_text(self, message, rest):
         """Resolve move text from inline text, a message link, or a reply."""
@@ -2232,6 +2247,14 @@ class LoreBot(commands.Bot):
                     tid, war, move_seq, actor_tag, is_npc, move_text, ruling, ruling_seq
                 )
 
+                # 8.5 Update the tactical NATO-symbology map (separate cheap pass).
+                if (self._war_map_cfg.get("enabled")
+                        and self._war_map_cfg.get("auto_update", True)):
+                    await self._update_war_map(
+                        thread, tid, move_seq, actor_tag, move_text, ruling,
+                        ruling_seq, reroll_or_revise=(existing_move_seq is not None),
+                    )
+
             # 9. Auto-generate AI responses for targeted NPC nations
             if (allow_npc_response and not is_npc
                     and self._war_cfg.get("npc_auto_respond", True)):
@@ -2270,6 +2293,182 @@ class LoreBot(commands.Bot):
                 self.war_store.set_digest(tid, digest.strip(), ruling_seq)
         except Exception:
             log.exception("War digest update failed for %s", tid)
+
+    # ---- Tactical war map (NATO symbology) --------------------------
+    async def _update_war_map(self, thread, tid, move_seq, actor_tag,
+                              move_text, ruling, ruling_seq, *,
+                              reroll_or_revise=False):
+        """Auto-update the tactical map after a ruling.
+
+        On a reroll/revise we first roll the battlefield back to the snapshot
+        taken before this move, so the map delta is re-derived cleanly rather
+        than stacked on top of the superseded ruling's changes.
+        """
+        try:
+            if reroll_or_revise:
+                self.war_store.restore_map_snapshot(tid, move_seq)
+            else:
+                self.war_store.snapshot_map_state(tid, move_seq)  # idempotent
+            instructions = (
+                f"MOVE #{move_seq} by {actor_tag}:\n{move_text}\n\n"
+                f"ADJUDICATED OUTCOME:\n{ruling}"
+            )
+            await self._run_war_map_session(
+                thread, tid, instructions,
+                seq_label=f"move #{move_seq}", ruling_seq=ruling_seq,
+            )
+        except Exception:
+            log.exception("War map auto-update failed for %s", tid)
+
+    async def _run_war_map_session(self, channel, tid, instructions, *,
+                                   seq_label, ruling_seq):
+        """Shared war-map LLM pass: update symbols/focus, persist, render, post."""
+        war = self.war_store.get_war(tid)
+        if not war:
+            return
+        state = self.war_store.get_map_state(tid)
+        focus = self.war_store.get_map_focus(tid)
+        bel = war.get("belligerents", {})
+        belmap = {t: info.get("side") for t, info in bel.items()}
+
+        # Territory resolver for realism: explicit province ownership first,
+        # then country-level occupation inherited by iso_cc.
+        occupation = self.map_store.get_occupation()
+        ownership = self.province_store.get_ownership()
+        iso_to_occ: Dict[str, str] = {}
+        for tag in occupation:
+            iso = map_renderer.TAG_TO_ISO2.get(tag)
+            if iso:
+                iso_to_occ.setdefault(iso, tag)
+
+        def _owner_of(pid, iso):
+            own = ownership.get(pid)
+            if own:
+                return own.player_tag
+            return iso_to_occ.get(iso)
+
+        bel_lines = []
+        for tag, info in bel.items():
+            iso = map_renderer.TAG_TO_ISO2.get(tag, "?")
+            ctrl = "AI" if info.get("npc") else "player"
+            bel_lines.append(f"  {tag} → {info.get('side')} ({ctrl}, iso {iso})")
+        context_blob = "\n".join([
+            "=== WAR BRIEFING ===", self._war_briefing(war), "",
+            "=== STATE DIGEST ===",
+            war.get("state_digest") or "(early in the war)", "",
+            "=== BELLIGERENTS (tag → side) ===",
+            "\n".join(bel_lines) or "(none)",
+        ])
+
+        _ws = self._mode_settings("war_map")
+        print(f"{_C_SEND}[WAR MAP  →] {war['war_id']} {seq_label} "
+              f"model={_ws['model'] or 'default'}{_C_RST}", flush=True)
+        symbols, new_focus, violations, _calls = await war_map_llm.update_war_map(
+            current_symbols=state["symbols"], current_focus=focus,
+            context_blob=context_blob, instructions=instructions,
+            client=self.llm, model=_ws["model"],
+            thinking_budget=_ws.get("thinking_budget"),
+            max_tool_depth=int(self._war_map_cfg.get("max_tool_depth", 8)),
+            max_advance_km=float(self._war_map_cfg.get("max_advance_km", 250)),
+            owner_of=_owner_of, belligerents=belmap,
+        )
+        self.war_store.set_map_state(tid, symbols, ruling_seq)
+        if new_focus:
+            self.war_store.set_map_focus(tid, new_focus)
+        await self._render_and_post_war_map(
+            channel, tid, war, seq_label, symbols, new_focus, violations
+        )
+
+    async def _render_and_post_war_map(self, channel, tid, war, seq_label,
+                                       symbols, focus, violations):
+        tags = list(war.get("belligerents", {}).keys())
+        occupation = self.map_store.get_occupation()
+        try:
+            png = await map_renderer.render_theater_map(
+                tags=tags, occupation=occupation, symbols=symbols, focus=focus,
+                buffer_deg=float(self._war_map_cfg.get("buffer_deg", 2.5)),
+                title=f"{war['war_id']} · THEATER",
+                subtitle=(f"{war.get('title', '')} — after {seq_label} · "
+                          f"{self.state.current_year}"),
+                year=self.state.current_year, **self._province_render_args(),
+            )
+        except Exception:
+            log.exception("Theater map render failed for %s", tid)
+            return
+        caption = (f"🗺️ **Theater map — after {seq_label}**  ·  "
+                   f"{war_map_llm.summarize_map(symbols)}")
+        if violations:
+            caption += "\n⚠️ **Realism flags:**\n" + "\n".join(
+                f"• {v}" for v in violations[:6])
+            if len(violations) > 6:
+                caption += f"\n• …+{len(violations) - 6} more"
+        fname = f"theater_{war['war_id']}_{seq_label.replace(' ', '').replace('#', '')}.png"
+        try:
+            await channel.send(
+                caption[:1900],
+                file=discord.File(fp=io.BytesIO(png), filename=fname),
+            )
+        except discord.HTTPException:
+            log.warning("Could not post theater map to thread %s", tid)
+
+    async def _war_map_cmd(self, message, thread, tid, rest):
+        """`!DNC war map [focus <…> | <instructions>]` — GM tactical-map control."""
+        if not self._war_map_cfg.get("enabled"):
+            await message.reply(
+                "⚠️ The war-map subsystem is disabled (`war.map.enabled`)."); return
+        war = self.war_store.get_war(tid)
+        if not war:
+            await message.reply("⚠️ No war in this thread to map."); return
+        rest = (rest or "").strip()
+        low = rest.lower()
+        if low.startswith("focus"):
+            await self._war_map_focus(message, tid, war, rest[5:].strip()); return
+        if not rest:
+            state = self.war_store.get_map_state(tid)
+            await self._render_and_post_war_map(
+                thread, tid, war, "latest", state["symbols"],
+                self.war_store.get_map_focus(tid), [])
+            return
+        if war.get("status") not in ("active", "pending_commit"):
+            await message.reply("⚠️ This war isn't live, so its map can't be edited."); return
+        self.flog.log_command("war map", str(message.author), thread.name, rest[:200])
+        async with thread.typing():
+            await self._run_war_map_session(
+                thread, tid, f"GM map instruction:\n{rest}",
+                seq_label="GM edit",
+                ruling_seq=self.war_store.get_map_state(tid)["updated_seq"],
+            )
+
+    async def _war_map_focus(self, message, tid, war, arg):
+        arg = (arg or "").strip()
+        if not arg:
+            cur = self.war_store.get_map_focus(tid)
+            await message.reply(
+                f"Theater focus: `{cur}`.\nSet with `{self.prefix} war map focus "
+                f"<place | TAG | auto>` — e.g. `{self.prefix} war map focus Cuba`, "
+                f"`… focus CUB`, or `… focus auto` to fit the units automatically.")
+            return
+        low = arg.lower()
+        if low in ("auto", "reset", "fit"):
+            focus = {"mode": "auto"}
+        elif re.match(r"^[A-Za-z]{2,4}$", arg) and arg.upper() in map_renderer.TAG_TO_NAME:
+            focus = {"mode": "tags", "tags": [arg.upper()]}
+        else:
+            res = map_geometry.lookup_province(arg, max_results=1)
+            if not res:
+                await message.reply(f"⚠️ Couldn't resolve a location from `{arg}`."); return
+            r0 = res[0]
+            if r0.get("kind") == "country" and r0.get("bbox"):
+                focus = {"mode": "bbox", "bbox": r0["bbox"]}
+            elif r0.get("centroid"):
+                lon, lat = r0["centroid"]
+                focus = {"mode": "place", "lon": lon, "lat": lat, "radius_km": 500}
+            else:
+                await message.reply(f"⚠️ Couldn't frame `{arg}`."); return
+        self.war_store.set_map_focus(tid, focus)
+        state = self.war_store.get_map_state(tid)
+        await self._render_and_post_war_map(
+            message.channel, tid, war, "latest", state["symbols"], focus, [])
 
     async def _maybe_npc_responses(self, thread, tid, actor_tag, actor_side,
                                    move_text, ruling):

@@ -198,6 +198,30 @@ WAR_MAP_TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "set_focus",
+            "description": (
+                "Frame the theater map. For most wars use mode 'auto' (the map "
+                "auto-fits to the units you place). For a DISTANT or expeditionary "
+                "war — e.g. a power invading an island or country far from its "
+                "homeland — use mode 'place' with the theater's name (e.g. 'Cuba') "
+                "so the map zooms to the fighting, not the empty ocean between the "
+                "belligerents. Use 'tags' to frame on whole countries by game tag."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["auto", "place", "tags"]},
+                    "place": {"type": "string", "description": "Place/country/region name for mode 'place' (resolved to coordinates)."},
+                    "radius_km": {"type": "number", "description": "Half-extent for mode 'place'. Default 500."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Game tags for mode 'tags'."},
+                },
+                "required": ["mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "check_realism",
             "description": (
                 "Validate the current battlefield against geography and the "
@@ -229,6 +253,12 @@ Headquarters units: set hq=true.
   * frontlines — ordered [lon, lat] polylines marking the forward line of troops.
   * arrows — axis of advance ('advance'/'attack') or 'withdraw'.
   * objectives — starred points (cities, passes, river crossings).
+
+Theater framing: by default the map auto-fits to the units you place. If this \
+war is fought far from a belligerent's homeland (an island landing, an \
+expeditionary or overseas campaign — e.g. one power invading Cuba), call \
+set_focus(mode='place', place='<theater>') so the map zooms to the actual \
+fighting instead of the empty ocean between the belligerents.
 
 Workflow for EVERY update:
   1. Call get_map_state to see existing symbols and their ids.
@@ -267,6 +297,7 @@ class _WarMapBackend:
         prior_symbols: list[dict],
         *,
         max_advance_km: float,
+        focus: Optional[dict] = None,
         owner_of: Optional[Callable[[str, str], Optional[str]]] = None,
         belligerents: Optional[dict[str, str]] = None,
         tavily: Any = None,
@@ -275,6 +306,7 @@ class _WarMapBackend:
             s["id"]: dict(s) for s in prior_symbols if s.get("id")
         }
         self.symbols: list[dict] = [dict(s) for s in prior_symbols]
+        self.focus: dict = dict(focus) if focus else {"mode": "auto"}
         self.max_advance_km = float(max_advance_km)
         self.owner_of = owner_of or (lambda pid, iso: None)
         self.belligerents = {k.upper(): v for k, v in (belligerents or {}).items()}
@@ -381,6 +413,8 @@ class _WarMapBackend:
                 self.symbols = [s for s in self.symbols if s.get("id") != sid]
                 ok = len(self.symbols) < before
                 return json.dumps({"removed": ok, "id": sid})
+            if name == "set_focus":
+                return self._set_focus(args)
             if name == "check_realism":
                 v = self._run_realism()
                 return json.dumps({"violations": v, "ok": not v})
@@ -443,6 +477,35 @@ class _WarMapBackend:
             out["arrow_id"] = arrow["id"]
         return json.dumps(out)
 
+    def _set_focus(self, args: dict) -> str:
+        mode = (args.get("mode") or "auto").lower()
+        if mode == "auto":
+            self.focus = {"mode": "auto"}
+        elif mode == "tags":
+            tags = [str(t).upper() for t in (args.get("tags") or []) if t]
+            if not tags:
+                return json.dumps({"error": "mode 'tags' needs a non-empty tags list"})
+            self.focus = {"mode": "tags", "tags": tags}
+        elif mode == "place":
+            place = (args.get("place") or "").strip()
+            if not place:
+                return json.dumps({"error": "mode 'place' needs a place name"})
+            res = map_geometry.lookup_province(place, max_results=1)
+            if not res:
+                return json.dumps({"error": f"could not resolve place {place!r}"})
+            r0 = res[0]
+            if r0.get("kind") == "country" and r0.get("bbox"):
+                self.focus = {"mode": "bbox", "bbox": r0["bbox"]}
+            elif r0.get("centroid"):
+                lon, lat = r0["centroid"]
+                self.focus = {"mode": "place", "lon": lon, "lat": lat,
+                              "radius_km": float(args.get("radius_km", 500) or 500)}
+            else:
+                return json.dumps({"error": f"could not frame {place!r}"})
+        else:
+            return json.dumps({"error": f"unknown focus mode {mode!r}"})
+        return json.dumps({"focus": self.focus})
+
     def _upsert(self, args: dict, *, kind: str, prefix: str, fields: list[str]) -> str:
         sid = (args.get("id") or "").strip()
         existing = self._find(sid) if sid else None
@@ -460,6 +523,7 @@ class _WarMapBackend:
 async def update_war_map(
     *,
     current_symbols: list[dict],
+    current_focus: Optional[dict] = None,
     context_blob: str,
     instructions: str,
     client: Any,
@@ -470,16 +534,16 @@ async def update_war_map(
     owner_of: Optional[Callable[[str, str], Optional[str]]] = None,
     belligerents: Optional[dict[str, str]] = None,
     tavily: Any = None,
-) -> tuple[list[dict], list[str], list[str]]:
+) -> tuple[list[dict], dict, list[str], list[str]]:
     """Run a war-map tool session.
 
-    Returns ``(new_symbols, violations, tool_calls)``. The new symbol set should
-    be persisted by the caller; violations are surfaced to the GM. A final
-    realism pass is always run so violations reflect the committed battlefield
-    even if the model forgot to call check_realism.
+    Returns ``(new_symbols, focus, violations, tool_calls)``. The new symbol set
+    and focus should be persisted by the caller; violations are surfaced to the
+    GM. A final realism pass is always run so violations reflect the committed
+    battlefield even if the model forgot to call check_realism.
     """
     backend = _WarMapBackend(
-        current_symbols, max_advance_km=max_advance_km,
+        current_symbols, max_advance_km=max_advance_km, focus=current_focus,
         owner_of=owner_of, belligerents=belligerents, tavily=tavily,
     )
     tools = list(_GEOMETRY_TOOLS) + list(WAR_MAP_TOOLS)
@@ -507,7 +571,7 @@ async def update_war_map(
     # Always reconcile realism against the final committed set.
     backend._run_realism()
     log.info("war-map tool calls: %s", backend.calls_made)
-    return backend.symbols, backend.violations, backend.calls_made
+    return backend.symbols, backend.focus, backend.violations, backend.calls_made
 
 
 def summarize_map(symbols: list[dict]) -> str:
