@@ -2196,8 +2196,22 @@ class LoreBot(commands.Bot):
                       f"{' [AI]' if is_npc else ''} model={_ws['model'] or 'default'}"
                       f"  thinking={_fmt_think(_ws['thinking_budget'])}{_C_RST}",
                       flush=True)
-                ruling, usage = await self.llm.chat_messages(msgs, **_ws)
-                self.state.add_usage("war", usage)
+                try:
+                    ruling, usage = await self.llm.chat_messages(msgs, **_ws)
+                    self.state.add_usage("war", usage)
+                except Exception as exc:
+                    log.exception("War ruling LLM error for move #%s", move_seq)
+                    await thread.send(
+                        f"⚠️ War ruling failed for move #{move_seq}: `{exc}`. "
+                        f"The move has been logged — please retry."
+                    )
+                    return
+                if not ruling:
+                    await thread.send(
+                        f"⚠️ The war ruling model returned an empty response for move #{move_seq}. "
+                        f"The move has been logged — please retry or ask a GM to reroll."
+                    )
+                    return
 
                 # 4. Supersede the prior ruling (revision/reroll) and delete its posts
                 if old_ruling_seq is not None:
