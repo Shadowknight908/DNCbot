@@ -125,6 +125,21 @@ war:
     archive_top_k: 12
     # Per-archive-item char cap for that nation-lore block.
     archive_item_chars: 4000
+  # --- WAR TACTICAL MAP (NATO symbology) ---
+  map:
+    # Master switch for the war-map subsystem.
+    enabled: true
+    # When true, the bot updates the tactical map automatically after each
+    # adjudicated move (a second, cheap LLM pass — like the state digest). Turn
+    # off to update the map only via the manual `!DNC war map <instructions>`.
+    auto_update: true
+    # Degrees of padding around the fitted theater extent when rendering.
+    buffer_deg: 2.5
+    # Plausible per-move ground advance (km) used by the realism check. Moves
+    # beyond this are flagged (not blocked) so the model can justify/correct.
+    max_advance_km: 250
+    # Max sequential tool rounds for the war-map LLM session.
+    max_tool_depth: 8
 
 # --- MODEL & PROVIDER SETTINGS ---
 models:
@@ -211,6 +226,15 @@ models:
       top_k:
       max_tokens:
       thinking_budget: 1500
+    # Tool-driven tactical-map cartographer (places NATO symbology, calls the
+    # geometry + realism tools). Wants a capable tool-caller; low temperature.
+    war_map:
+      model: z-ai/glm-5.1
+      temperature: 0.2
+      top_p:
+      top_k:
+      max_tokens:
+      thinking_budget: 800
     archivist:
       model: mistralai/ministral-14b-2512
       temperature: 0.3
