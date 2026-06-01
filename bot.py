@@ -1649,11 +1649,11 @@ class LoreBot(commands.Bot):
                         sent_msg_ids.append(str(m.id))
                         body_msg_ids.append(str(m.id))
 
-                # Add 🎲 reaction to first body message so the action author can reroll
+                # Add 🎲 reaction to last body message so the action author can reroll
                 if body_msg_ids:
                     try:
                         first_body = await effective_channel.fetch_message(
-                            int(body_msg_ids[0])
+                            int(body_msg_ids[-1])
                         )
                         await first_body.add_reaction("🎲")
                     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
@@ -2254,7 +2254,7 @@ class LoreBot(commands.Bot):
                 # 7. 🎲 reroll reaction + re-adjudication cache
                 if body_ids:
                     try:
-                        fb = await thread.fetch_message(int(body_ids[0]))
+                        fb = await thread.fetch_message(int(body_ids[-1]))
                         await fb.add_reaction("🎲")
                     except (discord.NotFound, discord.Forbidden,
                             discord.HTTPException):
