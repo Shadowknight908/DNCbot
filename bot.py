@@ -1990,7 +1990,11 @@ class LoreBot(commands.Bot):
         await self._send_chunked_reply(message, body)
 
     async def _resolve_war_move_text(self, message, rest):
-        """Resolve move text from inline text, a message link, or a reply."""
+        """Resolve move text from inline text, a message link, or a reply.
+
+        Returns (move_text, src_msg, image_urls).
+        image_urls are CDN URLs of image attachments on the source message.
+        """
         rest = (rest or "").strip()
         link = MSG_LINK_RE.search(rest)
         if link:
@@ -1999,18 +2003,25 @@ class LoreBot(commands.Bot):
                 if ch is None:
                     ch = await self.fetch_channel(int(link.group(2)))
                 tmsg = await ch.fetch_message(int(link.group(3)))
-                return (await self._message_text_with_documents(tmsg)).strip(), tmsg
+                imgs = [a.url for a in tmsg.attachments
+                        if a.content_type and a.content_type.startswith("image/")]
+                return (await self._message_text_with_documents(tmsg)).strip(), tmsg, imgs
             except Exception:
-                return "", None
+                return "", None, []
         if rest:
-            return rest, None
+            # Inline text — check for images on the command message itself
+            imgs = [a.url for a in message.attachments
+                    if a.content_type and a.content_type.startswith("image/")]
+            return rest, None, imgs
         if message.reference and message.reference.message_id:
             try:
                 tmsg = await message.channel.fetch_message(message.reference.message_id)
-                return (await self._message_text_with_documents(tmsg)).strip(), tmsg
+                imgs = [a.url for a in tmsg.attachments
+                        if a.content_type and a.content_type.startswith("image/")]
+                return (await self._message_text_with_documents(tmsg)).strip(), tmsg, imgs
             except Exception:
-                return "", None
-        return "", None
+                return "", None, []
+        return "", None, []
 
     async def _war_move(self, message, thread, tid, rest):
         war = self.war_store.get_active_war(tid)
@@ -2022,7 +2033,7 @@ class LoreBot(commands.Bot):
             await message.reply(
                 "⚠️ This war has ended and is awaiting its chronicle commit — "
                 "no further moves."); return
-        move_text, src_msg = await self._resolve_war_move_text(message, rest)
+        move_text, src_msg, move_images = await self._resolve_war_move_text(message, rest)
         if not move_text:
             await message.reply(
                 f"Usage: `{self.prefix} war move <what your nation does>` — "
@@ -2048,7 +2059,7 @@ class LoreBot(commands.Bot):
         await self._produce_war_ruling(
             thread=thread, tid=tid, invocation=message,
             actor_tag=actor_tag, actor_side=actor_side, is_npc=False,
-            move_text=move_text,
+            move_text=move_text, move_images=move_images,
             source_message_id=str((src_msg or message).id),
             author_id=str(message.author.id),
             author_name=message.author.display_name,
@@ -2095,6 +2106,7 @@ class LoreBot(commands.Bot):
                                   actor_tag, actor_side, is_npc, move_text,
                                   source_message_id, author_id, author_name,
                                   allow_npc_response, guidance=None,
+                                  move_images=None,
                                   revision_request=None, existing_move_seq=None,
                                   old_ruling_seq=None, old_ruling_msg_ids=None,
                                   is_reroll=False):
@@ -2157,9 +2169,18 @@ class LoreBot(commands.Bot):
                     ]
                 user_content = "\n".join(parts)
 
+                if move_images:
+                    user_msg_content = [{"type": "text", "text": user_content}]
+                    for img_url in move_images:
+                        user_msg_content.append(
+                            {"type": "image_url", "image_url": {"url": img_url}}
+                        )
+                else:
+                    user_msg_content = user_content
+
                 msgs = [
                     {"role": "system", "content": self.prompts.get("war_move_ruling")},
-                    {"role": "user", "content": user_content},
+                    {"role": "user", "content": user_msg_content},
                 ]
                 _ws = self._mode_settings("war")
                 print(f"{_C_SEND}[WAR      →] move#{move_seq} {actor_tag}"
